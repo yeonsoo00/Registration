@@ -15,14 +15,18 @@ def _expand_weight(weight: torch.Tensor, reference: torch.Tensor) -> torch.Tenso
     return weight
 
 
-def _masked_mean(values: torch.Tensor, weight: Optional[torch.Tensor], eps: float = 1e-8) -> torch.Tensor:
+def _masked_mean(
+    values: torch.Tensor, weight: Optional[torch.Tensor], eps: float = 1e-8
+) -> torch.Tensor:
     if weight is None:
         return values.mean()
     weight = _expand_weight(weight, values)
     return (values * weight).sum() / (weight.sum() + eps)
 
 
-def ssd_loss(moving: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+def ssd_loss(
+    moving: torch.Tensor, target: torch.Tensor, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """Mean squared difference, optionally restricted to the mineral mask."""
     return _masked_mean((moving - target).square(), weight)
 
@@ -66,12 +70,49 @@ def gradient_ncc_loss(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """NCC on Sobel-like gradient magnitudes for structural alignment."""
+
     def gradient_magnitude(x: torch.Tensor) -> torch.Tensor:
         gx = F.pad(x[..., 1:] - x[..., :-1], (0, 1, 0, 0), mode="replicate")
         gy = F.pad(x[..., 1:, :] - x[..., :-1, :], (0, 0, 0, 1), mode="replicate")
         return torch.sqrt(gx.square() + gy.square() + eps)
 
-    return ncc_loss(gradient_magnitude(moving), gradient_magnitude(target), weight=weight)
+    return ncc_loss(
+        gradient_magnitude(moving), gradient_magnitude(target), weight=weight
+    )
+
+
+def local_ncc_loss(moving, target, window_size=9, eps=1e-5):
+    """Local NCC that ignores uninformative flat fluorescence regions."""
+    if moving.shape != target.shape:
+        raise ValueError(f"Shape mismatch: {moving.shape} vs {target.shape}")
+    if window_size < 3 or window_size % 2 == 0:
+        raise ValueError("window_size must be an odd integer >= 3")
+    pad = window_size // 2
+    mm = F.avg_pool2d(moving, window_size, 1, pad)
+    mt = F.avg_pool2d(target, window_size, 1, pad)
+    vm = (F.avg_pool2d(moving.square(), window_size, 1, pad) - mm.square()).clamp_min(0)
+    vt = (F.avg_pool2d(target.square(), window_size, 1, pad) - mt.square()).clamp_min(0)
+    cov = F.avg_pool2d(moving * target, window_size, 1, pad) - mm * mt
+    corr = cov / torch.sqrt(vm * vt + eps)
+    informative = (vm + vt) > eps
+    return 1.0 - corr[informative].mean() if informative.any() else corr.new_tensor(1.0)
+
+
+def multiscale_local_ncc_loss(moving, target, scales=(1, 2, 4), window_size=9):
+    """Coarse-to-fine local NCC for a wider affine capture range."""
+    terms = []
+    for scale in scales:
+        if scale < 1:
+            raise ValueError("scales must contain positive integers")
+        m = moving if scale == 1 else F.avg_pool2d(moving, scale, scale)
+        t = target if scale == 1 else F.avg_pool2d(target, scale, scale)
+        terms.append(local_ncc_loss(m, t, window_size))
+    return torch.stack(terms).mean()
+
+
+def charbonnier_loss(moving, target, eps=1e-3):
+    """Robust photometric loss with bounded influence from stain artefacts."""
+    return torch.sqrt((moving - target).square() + eps * eps).mean()
 
 
 def mutual_information_loss(
@@ -113,7 +154,9 @@ def mutual_information_loss(
     joint = joint / (joint.sum(dim=(1, 2), keepdim=True) + eps)
     px = joint.sum(dim=2, keepdim=True)
     py = joint.sum(dim=1, keepdim=True)
-    mi = (joint * (torch.log(joint + eps) - torch.log(px + eps) - torch.log(py + eps))).sum((1, 2))
+    mi = (
+        joint * (torch.log(joint + eps) - torch.log(px + eps) - torch.log(py + eps))
+    ).sum((1, 2))
     return -mi.mean()
 
 
@@ -147,9 +190,10 @@ def correlation_ratio_loss(
     memberships = memberships / (memberships.sum(dim=-1, keepdim=True) + eps)
     weighted_memberships = memberships * w.unsqueeze(-1)
     bin_mass = weighted_memberships.sum(dim=1) + eps
-    conditional_mean = torch.bmm(
-        weighted_memberships.transpose(1, 2), y.unsqueeze(-1)
-    ).squeeze(-1) / bin_mass
+    conditional_mean = (
+        torch.bmm(weighted_memberships.transpose(1, 2), y.unsqueeze(-1)).squeeze(-1)
+        / bin_mass
+    )
     global_mean = (w * y).sum(dim=1, keepdim=True)
     between = (bin_mass * (conditional_mean - global_mean).square()).sum(dim=1)
     total = (w * (y - global_mean).square()).sum(dim=1) + eps
@@ -197,6 +241,53 @@ def jaccard_distance_loss(
     return 1.0 - score.mean()
 
 
+def soft_foreground_dice_loss(
+    moving: torch.Tensor,
+    target: torch.Tensor,
+    threshold: float = 0.35,
+    temperature: float = 12.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Align sparse foreground support without hard, non-differentiable masks."""
+
+    def foreground_response(image: torch.Tensor) -> torch.Tensor:
+        positive = F.relu(image).amax(dim=1, keepdim=True)
+        maximum = positive.amax(dim=(2, 3), keepdim=True)
+        return positive / (maximum + eps)
+
+    moving_unit = foreground_response(moving)
+    target_unit = foreground_response(target)
+    moving_mask = torch.sigmoid((moving_unit - threshold) * temperature)
+    target_mask = torch.sigmoid((target_unit - threshold) * temperature)
+    intersection = (moving_mask * target_mask).sum(dim=(1, 2, 3))
+    denominator = moving_mask.sum(dim=(1, 2, 3)) + target_mask.sum(dim=(1, 2, 3))
+    return 1.0 - ((2.0 * intersection + eps) / (denominator + eps)).mean()
+
+
+def multiscale_gradient_loss(
+    moving: torch.Tensor,
+    target: torch.Tensor,
+    scales: Sequence[int] = (1, 2, 4),
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """Robust coarse-to-fine edge displacement loss for sparse signals."""
+
+    def gradients(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gx = F.pad(image[..., 1:] - image[..., :-1], (0, 1, 0, 0))
+        gy = F.pad(image[..., 1:, :] - image[..., :-1, :], (0, 0, 0, 1))
+        return gx, gy
+
+    terms = []
+    for scale in scales:
+        m = moving if scale == 1 else F.avg_pool2d(moving, scale, scale)
+        t = target if scale == 1 else F.avg_pool2d(target, scale, scale)
+        mgx, mgy = gradients(m)
+        tgx, tgy = gradients(t)
+        terms.append(torch.sqrt((mgx - tgx).square() + eps * eps).mean())
+        terms.append(torch.sqrt((mgy - tgy).square() + eps * eps).mean())
+    return torch.stack(terms).mean()
+
+
 def param_loss(
     pred: torch.Tensor,
     true: torch.Tensor,
@@ -205,16 +296,40 @@ def param_loss(
     """Weighted MSE for `(tx, ty, theta, sx, sy)` registration labels."""
     error = (pred - true).square()
     if parameter_weights is not None:
-        weights = torch.as_tensor(parameter_weights, dtype=pred.dtype, device=pred.device)
+        weights = torch.as_tensor(
+            parameter_weights, dtype=pred.dtype, device=pred.device
+        )
         if weights.numel() != 5:
             raise ValueError("parameter_weights must contain five values")
         error = error * weights.view(1, 5)
     return error.mean()
 
 
+def affine_control_point_loss(
+    pred: torch.Tensor, true: torch.Tensor, beta: float = 0.02
+):
+    """Compare transforms by displacement instead of incompatible raw units."""
+    from utils import affine_parameters_to_matrix
+
+    points = pred.new_tensor(
+        [
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    pp = torch.einsum("bij,pj->bpi", affine_parameters_to_matrix(pred), points)
+    tp = torch.einsum("bij,pj->bpi", affine_parameters_to_matrix(true), points)
+    return F.smooth_l1_loss(pp, tp, beta=beta)
+
+
 def regularisation_loss(params: torch.Tensor) -> torch.Tensor:
     """Penalize transforms far from identity."""
-    identity = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0], device=params.device, dtype=params.dtype)
+    identity = torch.tensor(
+        [0.0, 0.0, 0.0, 1.0, 1.0], device=params.device, dtype=params.dtype
+    )
     return (params - identity).square().mean()
 
 
@@ -244,7 +359,6 @@ def bio_loss(
             penalties.append(intensity.new_zeros(()))
             continue
         penalties.append(
-            (intensity[i : i + 1] * penalty_region).sum()
-            / (penalty_region.sum() + eps)
+            (intensity[i : i + 1] * penalty_region).sum() / (penalty_region.sum() + eps)
         )
     return torch.stack(penalties).mean()

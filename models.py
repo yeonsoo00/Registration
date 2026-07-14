@@ -38,6 +38,25 @@ class ConvStage(nn.Module):
         return self.block(x)
 
 
+class ResidualInputAdapter(nn.Module):
+    """Small identity-initialized adapter specialized for one signal group."""
+
+    def __init__(self, channels: int, norm_type: str) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            _make_norm(channels, norm_type),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1, bias=True),
+        )
+        final = self.block[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return image + self.block(image)
+
+
 class GroupPairEncoder(nn.Module):
     """Encode a group representation against the fixed mineral image."""
 
@@ -91,7 +110,7 @@ class GroupPairEncoder(nn.Module):
             nn.Linear(channels[-1] * spatial_pool_size * spatial_pool_size, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Identity(),
         )
 
     @staticmethod
@@ -112,10 +131,16 @@ class GroupPairEncoder(nn.Module):
             for stage in self.joint:
                 feat = stage(feat)
         else:
-            gf = torch.cat([group_input, coords], dim=1) if coords is not None else group_input
+            gf = (
+                torch.cat([group_input, coords], dim=1)
+                if coords is not None
+                else group_input
+            )
             ff = torch.cat([fixed, coords], dim=1) if coords is not None else fixed
             fused = None
-            for gs, fs, fuse in zip(self.group_stages, self.fixed_stages, self.fuse_stages):
+            for gs, fs, fuse in zip(
+                self.group_stages, self.fixed_stages, self.fuse_stages
+            ):
                 gf = gs(gf)
                 ff = fs(ff)
                 fused = fuse(torch.cat([gf, ff, torch.abs(gf - ff), gf * ff], dim=1))
@@ -142,7 +167,7 @@ class AffineHead(nn.Module):
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Identity(),
             nn.Linear(256, 128),
             nn.LayerNorm(128),
             nn.GELU(),
@@ -185,11 +210,26 @@ class GroupAffineRegistrationModel(nn.Module):
         norm_type: str = "group",
         use_coordconv: bool = True,
         fusion_mode: str = "intermediate",
-        force_group1_identity: bool = True,
+        force_group1_identity: bool = False,
+        separate_group_heads: bool = False,
+        separate_group_adapters: bool = False,
     ) -> None:
         super().__init__()
         self.use_group_embedding = use_group_embedding
         self.force_group1_identity = force_group1_identity
+        self.separate_group_heads = separate_group_heads
+        self.separate_group_adapters = separate_group_adapters
+        self.num_groups = int(num_groups)
+        self.group_adapters = (
+            nn.ModuleList(
+                [
+                    ResidualInputAdapter(group_input_channels, norm_type)
+                    for _ in range(self.num_groups)
+                ]
+            )
+            if separate_group_adapters
+            else None
+        )
         self.encoder = GroupPairEncoder(
             group_input_channels=group_input_channels,
             fixed_channels=fixed_channels,
@@ -207,9 +247,21 @@ class GroupAffineRegistrationModel(nn.Module):
         else:
             self.group_embedding = None
             head_dim = latent_dim
-        self.head = AffineHead(
-            head_dim, scale_range, translation_limit, max_rotation_degrees
-        )
+        if separate_group_heads:
+            self.heads = nn.ModuleList(
+                [
+                    AffineHead(
+                        head_dim, scale_range, translation_limit, max_rotation_degrees
+                    )
+                    for _ in range(self.num_groups)
+                ]
+            )
+            self.head = None
+        else:
+            self.heads = None
+            self.head = AffineHead(
+                head_dim, scale_range, translation_limit, max_rotation_degrees
+            )
 
     def forward(
         self,
@@ -217,10 +269,51 @@ class GroupAffineRegistrationModel(nn.Module):
         fixed_mineral: torch.Tensor,
         group: torch.Tensor,
     ) -> torch.Tensor:
+        if group_input.ndim != 4 or fixed_mineral.ndim != 4:
+            raise ValueError("group_input and fixed_mineral must be BCHW tensors")
+        group_ids = group.reshape(-1)
+        batch_size = group_input.shape[0]
+        if fixed_mineral.shape[0] != batch_size or group_ids.numel() != batch_size:
+            raise ValueError(
+                "group_input, fixed_mineral, and group must have equal batch sizes"
+            )
+        if group_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("group IDs must use an integer tensor dtype")
+        group_ids = group_ids.long()
+        if torch.any((group_ids < 1) | (group_ids > self.num_groups)):
+            raise ValueError(f"group IDs must be in [1, {self.num_groups}]")
+        if self.group_adapters is not None:
+            adapted_chunks = []
+            index_chunks = []
+            for group_id in torch.unique(group_ids).tolist():
+                indices = torch.nonzero(
+                    group_ids == int(group_id), as_tuple=False
+                ).reshape(-1)
+                adapted_chunks.append(
+                    self.group_adapters[int(group_id) - 1](group_input[indices])
+                )
+                index_chunks.append(indices)
+            combined_indices = torch.cat(index_chunks)
+            restore_order = torch.argsort(combined_indices)
+            group_input = torch.cat(adapted_chunks, dim=0)[restore_order]
         latent = self.encoder(group_input, fixed_mineral)
         if self.group_embedding is not None:
-            latent = torch.cat([latent, self.group_embedding(group.reshape(-1))], dim=1)
-        params = self.head(latent)
+            latent = torch.cat([latent, self.group_embedding(group_ids)], dim=1)
+        if self.heads is None:
+            assert self.head is not None
+            params = self.head(latent)
+        else:
+            parameter_chunks = []
+            index_chunks = []
+            for group_id in torch.unique(group_ids).tolist():
+                indices = torch.nonzero(
+                    group_ids == int(group_id), as_tuple=False
+                ).reshape(-1)
+                parameter_chunks.append(self.heads[int(group_id) - 1](latent[indices]))
+                index_chunks.append(indices)
+            combined_indices = torch.cat(index_chunks)
+            restore_order = torch.argsort(combined_indices)
+            params = torch.cat(parameter_chunks, dim=0)[restore_order]
         if self.force_group1_identity:
             identity = params.new_tensor([0.0, 0.0, 0.0, 1.0, 1.0])
             mask = group.reshape(-1) == 1

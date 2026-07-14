@@ -24,6 +24,29 @@ import torch
 import torch.nn.functional as F
 
 
+def resolve_device(
+    device_spec: str, gpu_ids_spec: str
+) -> Tuple[torch.device, list[int]]:
+    """Resolve one primary device and optional DataParallel device IDs."""
+    requested = torch.device(device_spec)
+    if requested.type != "cuda":
+        return requested, []
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+
+    gpu_ids = [int(value) for value in gpu_ids_spec.split(",") if value.strip()]
+    if not gpu_ids:
+        gpu_ids = [requested.index if requested.index is not None else 0]
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("gpu_ids must not contain duplicates")
+    device_count = torch.cuda.device_count()
+    if any(gpu_id < 0 or gpu_id >= device_count for gpu_id in gpu_ids):
+        raise ValueError(
+            f"gpu_ids {gpu_ids} are invalid for {device_count} visible CUDA devices"
+        )
+    return torch.device(f"cuda:{gpu_ids[0]}"), gpu_ids
+
+
 def load_image(path: str, grayscale: bool = False) -> np.ndarray:
     """Load an image as float32 in [0, 1].
 
@@ -37,13 +60,17 @@ def load_image(path: str, grayscale: bool = False) -> np.ndarray:
     return arr
 
 
-def resize_image(image: np.ndarray, size: Tuple[int, int], *, nearest: bool = False) -> np.ndarray:
+def resize_image(
+    image: np.ndarray, size: Tuple[int, int], *, nearest: bool = False
+) -> np.ndarray:
     """Resize an image to `(height, width)` while preserving channel count."""
     interpolation = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
     return cv2.resize(image, (int(size[1]), int(size[0])), interpolation=interpolation)
 
 
-def normalize_image(image: np.ndarray, per_channel: bool = True, eps: float = 1e-6) -> np.ndarray:
+def normalize_image(
+    image: np.ndarray, per_channel: bool = True, eps: float = 1e-6
+) -> np.ndarray:
     """Z-score normalize a grayscale or RGB image.
 
     RGB images are normalized independently per channel by default so the
@@ -61,13 +88,152 @@ def normalize_image(image: np.ndarray, per_channel: bool = True, eps: float = 1e
     return (image - mean) / std
 
 
+def enhance_signal_for_registration(
+    image: np.ndarray,
+    color_space: str = "rgb",
+    strength: float = 0.7,
+    method: str = "contrast_edges",
+    sfo_hue_range_degrees: Tuple[float, float] = (70.0, 200.0),
+    morphology_kernel_size: int = 3,
+    morphology_iterations: int = 1,
+) -> np.ndarray:
+    """Create a three-channel structural encoder input.
+
+    ``contrast_edges`` is the original CLAHE/threshold/Sobel enhancement used
+    for CFO. ``trap_morphology`` closes fragmented TRAP foreground with
+    dilation followed by erosion. ``sfo_hue_selection`` selects green-to-cyan
+    signal through HSV hue while returning the requested color space. The
+    returned array stays RGB or HSV according to ``color_space``; original
+    images used by losses and output are untouched.
+    """
+    valid_methods = {"contrast_edges", "trap_morphology", "sfo_hue_selection"}
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("signal enhancement expects an HxWx3 image")
+    if color_space not in {"rgb", "hsv"}:
+        raise ValueError("color_space must be rgb or hsv")
+    if method not in valid_methods:
+        raise ValueError(f"Unsupported enhancement method: {method}")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("strength must be in [0, 1]")
+
+    source = np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def channel_structure(channel: np.ndarray) -> np.ndarray:
+        channel_u8 = np.clip(channel * 255.0, 0, 255).astype(np.uint8)
+        contrast = clahe.apply(channel_u8).astype(np.float32) / 255.0
+        threshold, _ = cv2.threshold(
+            channel_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        foreground = 1.0 / (
+            1.0
+            + np.exp(np.clip(-(channel * 255.0 - float(threshold)) / 12.0, -60.0, 60.0))
+        )
+        gx = cv2.Sobel(contrast, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(contrast, cv2.CV_32F, 0, 1, ksize=3)
+        edges = cv2.magnitude(gx, gy)
+        edges /= max(float(edges.max()), 1e-6)
+        return np.clip(contrast * foreground + 0.35 * edges, 0.0, 1.0)
+
+    if method == "sfo_hue_selection":
+        hue_low, hue_high = map(float, sfo_hue_range_degrees)
+        if not 0.0 <= hue_low < hue_high <= 360.0:
+            raise ValueError("SFO hue range must satisfy 0 <= low < high <= 360")
+        if color_space == "rgb":
+            selection_hsv = cv2.cvtColor(source, cv2.COLOR_RGB2HSV)
+            hue_degrees = selection_hsv[..., 0]
+            saturation = selection_hsv[..., 1]
+            value = selection_hsv[..., 2]
+        else:
+            selection_hsv = source
+            hue_degrees = source[..., 0] * 360.0
+            saturation = source[..., 1]
+            value = source[..., 2]
+
+        value_u8 = np.clip(value * 255.0, 0, 255).astype(np.uint8)
+        value_threshold, _ = cv2.threshold(
+            value_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        selected = (
+            (hue_degrees >= hue_low)
+            & (hue_degrees <= hue_high)
+            & (saturation >= 0.18)
+            & (value_u8 >= value_threshold)
+        ).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        selected = cv2.morphologyEx(selected, cv2.MORPH_OPEN, kernel)
+        selected = cv2.morphologyEx(selected, cv2.MORPH_CLOSE, kernel)
+        selected_float = selected.astype(np.float32)
+        selected_value = channel_structure(value) * selected_float
+
+        if color_space == "rgb":
+            selected_hsv = selection_hsv.copy()
+            selected_hsv[..., 1] *= selected_float
+            selected_hsv[..., 2] = selected_value
+            selected_area = np.clip(
+                cv2.cvtColor(selected_hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0
+            )
+        else:
+            selected_area = source * selected_float[..., None]
+            selected_area[..., 2] = selected_value
+
+        # Suppress every output channel outside the selected area so excluded
+        # signal cannot return through per-channel normalization.
+        return ((1.0 - strength) * source + strength * selected_area).astype(np.float32)
+
+    if method == "trap_morphology":
+        if morphology_kernel_size < 1 or morphology_kernel_size % 2 == 0:
+            raise ValueError("morphology_kernel_size must be a positive odd integer")
+        if morphology_iterations < 1:
+            raise ValueError("morphology_iterations must be positive")
+        if color_space != "rgb":
+            raise ValueError("trap_morphology requires RGB input")
+        intensity = source.max(axis=2)
+        intensity_u8 = np.clip(intensity * 255.0, 0, 255).astype(np.uint8)
+        _, foreground = cv2.threshold(
+            intensity_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (morphology_kernel_size, morphology_kernel_size),
+        )
+        dilated = cv2.dilate(foreground, kernel, iterations=morphology_iterations)
+        connected = cv2.erode(dilated, kernel, iterations=morphology_iterations)
+        connected_float = connected.astype(np.float32) / 255.0
+        structure = channel_structure(intensity)
+        connected_structure = np.clip(
+            np.maximum(structure * connected_float, 0.65 * connected_float),
+            0.0,
+            1.0,
+        )
+        structural_rgb = np.repeat(connected_structure[..., None], 3, axis=2)
+        return ((1.0 - strength) * source + strength * structural_rgb).astype(
+            np.float32
+        )
+
+    if color_space == "hsv":
+        enhanced = source.copy()
+        enhanced[..., 2] = (1.0 - strength) * source[
+            ..., 2
+        ] + strength * channel_structure(source[..., 2])
+        return enhanced
+
+    structural = np.stack(
+        [channel_structure(source[..., channel]) for channel in range(3)], axis=-1
+    )
+    return ((1.0 - strength) * source + strength * structural).astype(np.float32)
+
+
 def compute_mineral_mask(mineral_image: np.ndarray) -> np.ndarray:
     """Compute a binary mineral mask with Otsu thresholding."""
     if mineral_image.ndim == 3:
-        mineral_image = cv2.cvtColor(
-            np.clip(mineral_image * 255.0, 0, 255).astype(np.uint8),
-            cv2.COLOR_RGB2GRAY,
-        ).astype(np.float32) / 255.0
+        mineral_image = (
+            cv2.cvtColor(
+                np.clip(mineral_image * 255.0, 0, 255).astype(np.uint8),
+                cv2.COLOR_RGB2GRAY,
+            ).astype(np.float32)
+            / 255.0
+        )
     img_uint8 = np.clip(mineral_image * 255.0, 0, 255).astype(np.uint8)
     _, thresh = cv2.threshold(img_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     mask = (thresh > 0).astype(np.float32)
@@ -184,7 +350,10 @@ def apply_preprocess_geometry(
     to the fixed mineral canvas. This is required so moving, target, and fixed
     share one coordinate system before affine registration.
     """
-    if image.shape[0] != geometry.original_height or image.shape[1] != geometry.original_width:
+    if (
+        image.shape[0] != geometry.original_height
+        or image.shape[1] != geometry.original_width
+    ):
         image = resize_image(
             image,
             (geometry.original_height, geometry.original_width),
@@ -203,7 +372,9 @@ def apply_preprocess_geometry(
     )
 
     if image.ndim == 2:
-        canvas = np.zeros((geometry.output_height, geometry.output_width), dtype=np.float32)
+        canvas = np.zeros(
+            (geometry.output_height, geometry.output_width), dtype=np.float32
+        )
         canvas[
             geometry.pad_top : geometry.pad_top + geometry.resized_height,
             geometry.pad_left : geometry.pad_left + geometry.resized_width,
