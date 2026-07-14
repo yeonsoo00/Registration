@@ -2,3 +2,4 @@ ckpt/
 Results/
 wandb/
 __pycache__/
+Debug/
