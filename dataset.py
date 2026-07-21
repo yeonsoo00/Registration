@@ -1,6 +1,6 @@
 """Dataset for deployable stain-group affine registration.
 
-Each item contains registered Mineral, one padded stack of unregistered moving
+Each item contains a fixed Mineral image, one padded stack of unregistered moving
 stains, and (when explicitly required) the matching registered stain stack used
 only as supervision. Missing group members are zero-filled. Consequently one
 model prediction can be shared by every valid stain acquired in that group.
@@ -106,14 +106,16 @@ class CartilageDataset(Dataset):
     When require_registered_targets is true, only matching moving/target stain
     pairs are valid for real samples. Synthetic samples use a registered target
     as their source and therefore do not require an unregistered file. When it
-    is false, item discovery and validity depend only on registered Mineral and
+    is false, item discovery and validity depend only on fixed Mineral and
     unregistered moving stains; target slots are returned as zeros and
-    target-group files are never decoded.
+    target-group files are never decoded. fixed_mineral_root defaults to
+    registered_root for training compatibility, but inference may point it at
+    the deployment input root independently of optional evaluation targets.
     """
 
     def __init__(
         self,
-        registered_root: str,
+        registered_root: Optional[str],
         unregistered_root: str,
         size: Tuple[int, int] = (512, 512),
         image_mode: str = "rgb",
@@ -130,6 +132,7 @@ class CartilageDataset(Dataset):
         synthetic_seed: int = 1234,
         include_group1: bool = True,
         require_registered_targets: bool = True,
+        fixed_mineral_root: Optional[str] = None,
     ) -> None:
         super().__init__()
         if image_mode not in {"rgb", "gray"}:
@@ -147,12 +150,26 @@ class CartilageDataset(Dataset):
             )
         if len(size) != 2 or any(int(value) < 1 for value in size):
             raise ValueError("size must contain two positive integers")
-        if not os.path.isdir(registered_root):
+        if require_registered_targets and not registered_root:
+            raise ValueError(
+                "registered_root is required when registered targets are requested"
+            )
+        if registered_root and not os.path.isdir(registered_root):
             raise FileNotFoundError(
-                f"Registered Mineral root does not exist: {registered_root}"
+                f"Registered target root does not exist: {registered_root}"
+            )
+        resolved_fixed_mineral_root = fixed_mineral_root or registered_root
+        if not resolved_fixed_mineral_root:
+            raise ValueError(
+                "fixed_mineral_root is required when registered_root is omitted"
+            )
+        if not os.path.isdir(resolved_fixed_mineral_root):
+            raise FileNotFoundError(
+                "Fixed Mineral root does not exist: " f"{resolved_fixed_mineral_root}"
             )
 
         self.registered_root = registered_root
+        self.fixed_mineral_root = resolved_fixed_mineral_root
         self.unregistered_root = unregistered_root
         self.size = tuple(map(int, size))
         self.image_mode = image_mode
@@ -179,10 +196,17 @@ class CartilageDataset(Dataset):
         ] = {}
         self._fixed_cache: Dict[str, Tuple[torch.Tensor, PreprocessGeometry]] = {}
 
-        registered_directories = {
+        registered_directories: Dict[str, str] = {}
+        if registered_root:
+            registered_directories = {
+                _base_id_cartilage(name): name
+                for name in os.listdir(registered_root)
+                if os.path.isdir(os.path.join(registered_root, name))
+            }
+        fixed_mineral_directories = {
             _base_id_cartilage(name): name
-            for name in os.listdir(registered_root)
-            if os.path.isdir(os.path.join(registered_root, name))
+            for name in os.listdir(self.fixed_mineral_root)
+            if os.path.isdir(os.path.join(self.fixed_mineral_root, name))
         }
         unregistered_directories: Dict[str, str] = {}
         if os.path.isdir(unregistered_root):
@@ -203,13 +227,20 @@ class CartilageDataset(Dataset):
         self.items: List[Tuple[str, int, None]] = []
         missing_target_pairs: List[str] = []
 
-        for base_id, registered_name in sorted(registered_directories.items()):
-            all_registered_stains = _find_stains(
-                os.path.join(registered_root, registered_name)
+        for base_id, fixed_mineral_name in sorted(fixed_mineral_directories.items()):
+            fixed_mineral_stains = _find_stains(
+                os.path.join(self.fixed_mineral_root, fixed_mineral_name)
             )
-            mineral_path = all_registered_stains.get(1)
+            mineral_path = fixed_mineral_stains.get(1)
             if mineral_path is None:
                 continue
+
+            registered_name = registered_directories.get(base_id)
+            all_registered_stains = _find_stains(
+                os.path.join(registered_root, registered_name)
+                if registered_root and registered_name
+                else ""
+            )
 
             unregistered_name = unregistered_directories.get(base_id)
             unregistered_stains = _find_stains(
@@ -264,7 +295,7 @@ class CartilageDataset(Dataset):
                 else ""
             )
             raise RuntimeError(
-                "No usable grouped registration items were found from registered "
+                "No usable grouped registration items were found from fixed "
                 f"Mineral and moving stains{target_note}"
             )
 
@@ -411,10 +442,10 @@ class CartilageDataset(Dataset):
             valid_list.append(valid)
             output_stain_indices.append(stain_index)
 
-        params_true = torch.tensor(
-            [0.0, 0.0, 0.0, 1.0, 1.0],
-            dtype=torch.float32,
-        )
+        # Real observations have no affine label. NaN is an explicit undefined
+        # sentinel, not an identity target; every consumer must gate this tensor
+        # with has_params before using it as parameter supervision.
+        params_true = torch.full((5,), float("nan"), dtype=torch.float32)
         has_params = False
         if synthetic:
             params_true = sample_registration_parameters(

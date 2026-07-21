@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 from collections import OrderedDict, defaultdict
 from typing import Any, Dict, List
 
@@ -31,12 +32,13 @@ from models import (
 from utils import (
     STRUCTURAL_CHANNEL_NAMES,
     affine_parameters_to_matrix,
-    apply_affine_transform,
     compute_mineral_mask,
     compute_preprocess_geometry,
     load_image,
     normalized_affine_to_pixel_matrix,
     resolve_device,
+    save_group_overlay as _save_group_overlay,
+    warp_model_space_group,
 )
 
 
@@ -68,7 +70,14 @@ def safe_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--registered_root", required=True)
+    p.add_argument(
+        "--registered_root",
+        default=None,
+        help=(
+            "Optional registered target root. Supplying it automatically enables "
+            "registered-target MAE/NCC evaluation; it is never a model input."
+        ),
+    )
     p.add_argument("--unregistered_root", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--batch_size", type=int, default=4)
@@ -91,13 +100,29 @@ def parse_args():
     p.add_argument(
         "--eval_with_registered_targets",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
-            "Load registered moving-stain counterparts after prediction and "
-            "report diagnostics; targets are never model inputs"
+            "Deprecated compatibility alias. Evaluation is enabled automatically "
+            "whenever --registered_root is supplied."
         ),
     )
     return p.parse_args()
+
+
+def _registered_evaluation_enabled(a) -> bool:
+    registered_root = getattr(a, "registered_root", None)
+    legacy_choice = getattr(a, "eval_with_registered_targets", None)
+    if legacy_choice is True and not registered_root:
+        raise ValueError(
+            "--eval_with_registered_targets requires --registered_root; the flag "
+            "is otherwise no longer needed"
+        )
+    if legacy_choice is False and registered_root:
+        raise ValueError(
+            "--no-eval_with_registered_targets conflicts with --registered_root; "
+            "remove registered_root for target-free inference"
+        )
+    return bool(registered_root)
 
 
 def save_rgb(path, img):
@@ -122,18 +147,6 @@ def make_mineral_group_overlay(
     if not aligned_group_images:
         raise ValueError("No aligned group images for Mineral overlap")
     return make_overlay([mineral_rgb, *aligned_group_images])
-
-
-def warp_group(moving_group: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-    """Apply one predicted matrix to every stain slot in each group."""
-    batch_size, slots, channels, height, width = moving_group.shape
-    matrices = affine_parameters_to_matrix(params)
-    matrices = matrices[:, None].expand(batch_size, slots, 2, 3)
-    flattened = moving_group.reshape(batch_size * slots, channels, height, width)
-    warped = apply_affine_transform(
-        flattened, matrices.reshape(batch_size * slots, 2, 3)
-    )
-    return warped.reshape(batch_size, slots, channels, height, width)
 
 
 def _rectangular_signal_support(
@@ -220,10 +233,11 @@ def load_student_checkpoint(checkpoint_path: str):
             "original Correlation_Vol_Net checkpoints cannot be loaded because "
             "their checkpoint and model contracts differ."
         )
-    if checkpoint.get("checkpoint_type") != "deployable_student":
+    checkpoint_type = checkpoint.get("checkpoint_type")
+    if checkpoint_type not in {"deployable_student", "full_training"}:
         raise ValueError(
-            "Inference requires the derived student-only checkpoint (for example, "
-            "stage2_best_model_student.pt), not the full teacher-training checkpoint"
+            "Inference requires either a full training checkpoint or its derived "
+            "student-only artifact"
         )
     required_keys = {
         "preprocess_config",
@@ -245,9 +259,25 @@ def load_student_checkpoint(checkpoint_path: str):
     return preprocess_config, student_config, student_state
 
 
+def predict_model_space_group(model, batch):
+    """Run the deployable student and the canonical model-space warp."""
+    predicted_params = model(
+        fixed_mineral=batch["fixed_mineral"],
+        moving_group=batch["moving_group"],
+        group=batch["group_id"],
+    )
+    warped_group = warp_model_space_group(
+        batch["moving_group"],
+        predicted_params,
+    )
+    return predicted_params, warped_group
+
+
 def main(a):
     if a.max_items < 0:
         raise ValueError("max_items cannot be negative")
+    evaluate_registered_targets = _registered_evaluation_enabled(a)
+    registered_root = getattr(a, "registered_root", None)
     device, gpu_ids = resolve_device(a.device, a.gpu_ids)
     # Deserialize on CPU so teacher and optimizer tensors never occupy inference
     # GPU memory. Only the extracted student state is copied to the model.
@@ -328,8 +358,8 @@ def main(a):
             f"input contract {INPUT_CONTRACT_VERSION!r}"
         )
     ds = CartilageDataset(
-        a.registered_root,
-        a.unregistered_root,
+        registered_root=registered_root,
+        unregistered_root=a.unregistered_root,
         size=(pre["height"], pre["width"]),
         image_mode=pre["image_mode"],
         sfo_mode=pre["sfo_mode"],
@@ -342,7 +372,8 @@ def main(a):
             if a.include_group1 is None
             else a.include_group1
         ),
-        require_registered_targets=a.eval_with_registered_targets,
+        require_registered_targets=evaluate_registered_targets,
+        fixed_mineral_root=a.unregistered_root,
     )
     if ds.channels != cfg["input_channels"]:
         raise ValueError(
@@ -370,8 +401,10 @@ def main(a):
     model.eval()
     aligned_root = os.path.join(a.output_dir, "aligned_original_rgb")
     overlay_root = os.path.join(a.output_dir, "group_overlays")
+    model_space_overlay_root = os.path.join(a.output_dir, "model_space_group_overlays")
     os.makedirs(aligned_root, exist_ok=True)
     os.makedirs(overlay_root, exist_ok=True)
+    os.makedirs(model_space_overlay_root, exist_ok=True)
     rows = []
     metric_rows = []
     offset = 0
@@ -379,28 +412,54 @@ def main(a):
     mineral_images: Dict[str, np.ndarray] = {}
     with torch.no_grad():
         for batch in dl:
-            fixed_mineral = batch["fixed_mineral"].to(device, non_blocking=True)
-            moving_group = batch["moving_group"].to(device, non_blocking=True)
-            group = batch["group_id"].to(device, non_blocking=True)
-            params = model(
-                fixed_mineral=fixed_mineral,
-                moving_group=moving_group,
-                group=group,
-            )
+            for key in (
+                "fixed_mineral",
+                "moving_group",
+                "target_group",
+                "valid_group",
+                "group_id",
+                "params_true",
+                "has_params",
+            ):
+                batch[key] = batch[key].to(device, non_blocking=True)
+            if bool(batch["has_params"].any()):
+                raise RuntimeError(
+                    "Inference must use real moving groups with has_params=False"
+                )
+            params, warped_model_group = predict_model_space_group(model, batch)
+            # Matrix reconstruction below is only for the separate
+            # original-resolution OpenCV export. Model-space rendering is
+            # complete above and shares no independent affine logic here.
             mats = affine_parameters_to_matrix(params)
-            bs = fixed_mineral.shape[0]
-            if a.eval_with_registered_targets:
-                target_group = batch["target_group"].to(device, non_blocking=True)
-                valid_group_device = batch["valid_group"].to(device, non_blocking=True)
-                warped_model_group = warp_group(moving_group, params)
+            bs = batch["fixed_mineral"].shape[0]
+            if evaluate_registered_targets:
                 batch_mae, batch_ncc = registered_target_metrics(
-                    warped_model_group, target_group, valid_group_device
+                    warped_model_group,
+                    batch["target_group"],
+                    batch["valid_group"],
                 )
                 batch_mae = batch_mae.cpu()
                 batch_ncc = batch_ncc.cpu()
             for j in range(bs):
                 ds_idx = selected_indices[offset + j]
                 sample_name, group_id, _ = ds.items[ds_idx]
+                predicted_group_id = int(batch["group_id"][j])
+                if predicted_group_id != int(group_id):
+                    raise AssertionError(
+                        "Inference loader order no longer matches dataset items"
+                    )
+                safe_sample = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_name)
+                model_space_filename = (
+                    f"{offset + j:05d}_{safe_sample}_G{predicted_group_id}.png"
+                )
+                _save_group_overlay(
+                    os.path.join(model_space_overlay_root, model_space_filename),
+                    batch["fixed_mineral"][j],
+                    warped_model_group[j],
+                    batch["valid_group"][j],
+                    predicted_group_id,
+                    pre["sfo_mode"],
+                )
                 sample = ds.samples[sample_name]
                 unreg_stains = sample["unreg_stains"]
                 mineral_path = str(sample["mineral"])
@@ -467,7 +526,7 @@ def main(a):
                             "output": out,
                         }
                     )
-                    if a.eval_with_registered_targets:
+                    if evaluate_registered_targets:
                         metric_rows.append(
                             {
                                 "sample": sample_name,
@@ -501,7 +560,7 @@ def main(a):
         writer = csv.DictWriter(f, fieldnames=field_names)
         writer.writeheader()
         writer.writerows(rows)
-    if a.eval_with_registered_targets:
+    if evaluate_registered_targets:
         metric_path = os.path.join(a.output_dir, "registered_target_metrics.csv")
         with open(metric_path, "w", newline="") as f:
             field_names = list(metric_rows[0]) if metric_rows else ["sample"]
@@ -516,8 +575,9 @@ def main(a):
                 f"NCC={mean_ncc:.6f} ({len(metric_rows)} stains)"
             )
     print(
-        f"Saved {len(rows)} aligned stain images, group overlays, and Mineral "
-        f"overlaps to {a.output_dir}"
+        f"Saved {len(rows)} aligned original-resolution stains, {offset} "
+        "validation-style model-space overlays, original-resolution group "
+        f"overlays, and Mineral overlaps to {a.output_dir}"
     )
 
 

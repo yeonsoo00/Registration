@@ -14,6 +14,7 @@ import argparse
 import csv
 import os
 import re
+import warnings
 from collections import OrderedDict
 from typing import Iterable
 
@@ -24,6 +25,7 @@ from PIL import Image, ImageDraw
 from dataset import CartilageDataset
 from losses import affine_control_point_loss
 from models import (
+    TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
     canonicalize_model_config,
 )
@@ -109,6 +111,23 @@ def load_full_teacher_student_checkpoint(checkpoint_path: str, device: torch.dev
         raise ValueError(
             "Checkpoint input contract differs from this audit: "
             f"{preprocess.get('input_contract_version')!r}"
+        )
+
+    saved_teacher_input_version = (checkpoint.get("model_config") or {}).get(
+        "teacher_fixed_input_version"
+    )
+    if saved_teacher_input_version is None:
+        warnings.warn(
+            "This checkpoint predates the Mineral-aware teacher input contract; "
+            "the audit will replay its compatible weights with the current "
+            "Mineral + target teacher path.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif saved_teacher_input_version != TEACHER_FIXED_INPUT_VERSION:
+        raise ValueError(
+            "Checkpoint teacher fixed-input contract differs from this audit: "
+            f"{saved_teacher_input_version!r}"
         )
 
     student_model_config = canonicalize_model_config(checkpoint["student_model_config"])
@@ -527,9 +546,10 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
     emit(f"output_run_dir = {os.path.abspath(run_dir)}")
     emit("real_unregistered_root = NOT USED (the audit passes an empty path)")
     emit(f"frontend_mode = {frontend_mode}")
+    emit(f"teacher_fixed_input_version = {TEACHER_FIXED_INPUT_VERSION}")
     emit(
-        "teacher_fixed_source = target_group "
-        f"{frontend_mode} frontend representation, NOT Mineral"
+        "teacher_fixed_source = evidence-aware mean of target_group and Mineral "
+        f"{frontend_mode} frontend representations"
     )
     emit(
         "moving_source = synthetic inverse-matrix warp of target_group, "
@@ -561,6 +581,7 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
             }
             params_true = batch["params_true"]
             teacher_params = model.forward_teacher(
+                fixed_mineral=batch["fixed_mineral"],
                 target_group=batch["target_group"],
                 moving_group=batch["moving_group"],
                 group=batch["group_id"],
@@ -640,8 +661,10 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
             (
                 teacher_fixed_representation,
                 teacher_fixed_valid,
-            ) = teacher_branch.group_frontend_representation(
-                batch["target_group"].float(), batch["group_id"]
+            ) = teacher_branch.teacher_fixed_frontend_representation(
+                batch["fixed_mineral"].float(),
+                batch["target_group"].float(),
+                batch["group_id"],
             )
 
             safe_base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(base_id))
@@ -651,10 +674,10 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
             os.makedirs(item_dir, exist_ok=True)
             valid_single = sample["valid_group"]
             images = {
-                "fixed_mineral_not_teacher_source": _display_rgb(
+                "fixed_mineral_teacher_source": _display_rgb(
                     sample["fixed_mineral"], 1, "rgb"
                 ),
-                "teacher_fixed_source_target_group_union": _group_union(
+                "target_group_teacher_source": _group_union(
                     sample["target_group"], valid_single, group_id, sfo_mode
                 ),
                 "moving_source_synthetic_warped_target_group": _group_union(
@@ -705,12 +728,12 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
                 os.path.join(item_dir, "flow_panel.png"),
                 [
                     (
-                        "Mineral (not teacher)",
-                        images["fixed_mineral_not_teacher_source"],
+                        "Mineral (teacher fixed input)",
+                        images["fixed_mineral_teacher_source"],
                     ),
                     (
-                        f"teacher fixed: {frontend_mode}",
-                        images["teacher_fixed_source_target_group_union"],
+                        f"target_group (teacher fixed input): {frontend_mode}",
+                        images["target_group_teacher_source"],
                     ),
                     (
                         "moving: synthetic",
@@ -742,8 +765,8 @@ def run_audit(args: argparse.Namespace) -> list[dict]:
             ]
             emit(f"[{output_index:03d}] sample={base_id} group=G{group_id}")
             emit(
-                "  teacher_fixed_source = target_group "
-                f"{frontend_mode} frontend, not Mineral"
+                "  teacher_fixed_source = evidence-aware mean of target_group and "
+                f"Mineral {frontend_mode} frontends"
             )
             emit(
                 "  moving_source = synthetic warped target_group, "

@@ -21,6 +21,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
+import inference as inference_module
+import train as train_module
+import utils as utils_module
 from dataset import CartilageDataset, MAX_GROUP_STAINS
 from debug_teacher import (
     _direction_status,
@@ -43,6 +46,7 @@ from models import (
     SeparatedAffineHead,
     SeparatedResidualAffineHead,
     STRUCTURAL_DESCRIPTOR_VERSION,
+    TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
     coarse_similarity_from_cost_stats,
     compose_similarity_and_residual_affine,
@@ -174,6 +178,39 @@ def assert_frontend_cli_contract() -> None:
         assert parsed.affine_head_mode == affine_head_mode
     assert _parse_train_cli("--freeze_teacher").freeze_teacher is True
     assert _parse_train_cli("--no-freeze_teacher").freeze_teacher is False
+
+    inference_argv = [
+        "inference.py",
+        "--checkpoint",
+        "student.pt",
+        "--unregistered_root",
+        "unregistered",
+        "--output_dir",
+        "output",
+    ]
+    with mock.patch.object(sys, "argv", inference_argv):
+        target_free = inference_module.parse_args()
+    assert target_free.registered_root is None
+    assert target_free.eval_with_registered_targets is None
+    assert not inference_module._registered_evaluation_enabled(target_free)
+
+    with mock.patch.object(
+        sys, "argv", [*inference_argv, "--registered_root", "registered"]
+    ):
+        diagnostic = inference_module.parse_args()
+    assert diagnostic.registered_root == "registered"
+    assert inference_module._registered_evaluation_enabled(diagnostic)
+    assert inference_module._registered_evaluation_enabled(
+        SimpleNamespace(registered_root="registered", eval_with_registered_targets=True)
+    )
+    try:
+        inference_module._registered_evaluation_enabled(
+            SimpleNamespace(registered_root=None, eval_with_registered_targets=True)
+        )
+    except ValueError as error:
+        assert "--registered_root" in str(error)
+    else:
+        raise AssertionError("Legacy evaluation flag accepted no registered root")
 
     for flag, invalid in (
         ("--frontend_mode", "pixels"),
@@ -477,6 +514,13 @@ def assert_frontend_forward_matrix(
             "group",
         )
         assert tuple(inspect.signature(wrapper.teacher.forward).parameters) == (
+            "fixed_mineral",
+            "target_group",
+            "moving_group",
+            "group",
+        )
+        assert tuple(inspect.signature(wrapper.forward_teacher).parameters) == (
+            "fixed_mineral",
             "target_group",
             "moving_group",
             "group",
@@ -484,7 +528,7 @@ def assert_frontend_forward_matrix(
         wrapper.eval()
         with torch.no_grad():
             student_params = wrapper(fixed, moving, group)
-            teacher_params = wrapper.forward_teacher(target, moving, group)
+            teacher_params = wrapper.forward_teacher(fixed, target, moving, group)
         assert student_params.shape == teacher_params.shape == (1, 5)
         assert torch.isfinite(student_params).all()
         assert torch.isfinite(teacher_params).all()
@@ -501,6 +545,98 @@ def assert_frontend_forward_matrix(
             raise AssertionError(
                 f"{frontend_mode}/{group_input_mode} student accepted target_group"
             )
+
+
+def assert_teacher_mineral_fusion_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    """Prove that both registered fixed sources feed every teacher frontend."""
+    toy_target = torch.full((1, 2, 2, 2), 2.0, device=device)
+    toy_mineral = torch.full_like(toy_target, 4.0)
+    toy_target_valid = torch.tensor(
+        (((True, True), (False, False)),), device=device
+    ).unsqueeze(1)
+    toy_mineral_valid = torch.tensor(
+        (((True, False), (True, False)),), device=device
+    ).unsqueeze(1)
+    fusion_model = CorrelationVolumeAffineRegistrationModel(**build_config()).to(device)
+    toy_fused, toy_valid = fusion_model.fuse_teacher_fixed_representations(
+        toy_target, toy_mineral, toy_target_valid, toy_mineral_valid
+    )
+    expected_fused = toy_target.new_tensor(
+        [[[[3.0, 2.0], [4.0, 0.0]], [[3.0, 2.0], [4.0, 0.0]]]]
+    )
+    expected_valid = toy_target_valid | toy_mineral_valid
+    torch.testing.assert_close(toy_fused, expected_fused)
+    assert torch.equal(toy_valid, expected_valid)
+
+    fixed, moving, target, group = _frontend_inputs(device, height, width)
+    alternate_fixed = torch.zeros_like(fixed)
+    alternate_fixed[:, 0, 2 : height // 2, width // 2 : width - 2] = 0.95
+    alternate_fixed[:, 1, height // 2 : height - 2, 2 : width // 3] = 0.35
+    alternate_target = torch.roll(target, shifts=(4, -5), dims=(-2, -1))
+
+    for frontend_mode, group_input_mode in (
+        ("structural", "overlay"),
+        ("raw", "overlay"),
+        ("hybrid", "stack"),
+    ):
+        wrapper = TeacherStudentAffineRegistrationModel(
+            student_config=build_config(frontend_mode, group_input_mode),
+            use_teacher_branch=True,
+        ).to(device)
+        assert wrapper.teacher is not None
+        teacher = wrapper.teacher
+        _randomize_affine_outputs(teacher, -0.17)
+
+        target_representation, target_valid = teacher.group_frontend_representation(
+            target, group
+        )
+        mineral_representation, mineral_valid = teacher.mineral_frontend_representation(
+            fixed
+        )
+        fused, fused_valid = teacher.teacher_fixed_frontend_representation(
+            fixed, target, group
+        )
+        target_weight = target_valid.to(target_representation.dtype)
+        mineral_weight = mineral_valid.to(target_representation.dtype)
+        expected = (
+            target_representation * target_weight
+            + mineral_representation * mineral_weight
+        ) / (target_weight + mineral_weight).clamp_min(1.0)
+        expected_valid = target_valid | mineral_valid
+        expected = expected * expected_valid.to(expected.dtype)
+        torch.testing.assert_close(fused, expected)
+        assert torch.equal(fused_valid, expected_valid)
+
+        altered_mineral_fused, _ = teacher.teacher_fixed_frontend_representation(
+            alternate_fixed, target, group
+        )
+        altered_target_fused, _ = teacher.teacher_fixed_frontend_representation(
+            fixed, alternate_target, group
+        )
+        assert not torch.equal(fused, altered_mineral_fused)
+        assert not torch.equal(fused, altered_target_fused)
+
+        teacher.eval()
+        with torch.no_grad():
+            base_params = wrapper.forward_teacher(fixed, target, moving, group)
+            mineral_changed_params = wrapper.forward_teacher(
+                alternate_fixed, target, moving, group
+            )
+            target_changed_params = wrapper.forward_teacher(
+                fixed, alternate_target, moving, group
+            )
+        assert torch.isfinite(base_params).all()
+        assert not torch.equal(base_params, mineral_changed_params)
+        assert not torch.equal(base_params, target_changed_params)
+
+    try:
+        wrapper.forward_teacher(fixed[..., :-1], target, moving, group)
+    except ValueError as error:
+        assert "fixed_mineral shape" in str(error)
+    else:
+        raise AssertionError("Teacher accepted a mismatched Mineral shape")
 
 
 def _zero_mineral_descriptor(
@@ -606,7 +742,9 @@ def assert_raw_and_hybrid_frontend_contract(
         torch.no_grad(),
     ):
         assert torch.isfinite(raw_wrapper(fixed, moving, group)).all()
-        assert torch.isfinite(raw_wrapper.forward_teacher(target, moving, group)).all()
+        assert torch.isfinite(
+            raw_wrapper.forward_teacher(fixed, target, moving, group)
+        ).all()
 
     hsv_stack = torch.zeros_like(moving)
     hsv_stack[:, 0, 0, 6:-7, 5:-8] = 0.48
@@ -676,7 +814,9 @@ def assert_raw_and_hybrid_frontend_contract(
         wrapper.eval()
         with torch.no_grad():
             zero_student = wrapper(zero_fixed, zero_group, group)
-            zero_teacher = wrapper.forward_teacher(zero_group, zero_group, group)
+            zero_teacher = wrapper.forward_teacher(
+                zero_fixed, zero_group, zero_group, group
+            )
         assert torch.equal(zero_student, identity)
         assert torch.equal(zero_teacher, identity)
 
@@ -696,16 +836,17 @@ def _write_signal(path: Path, *, shift_x: int, color: tuple[int, int, int]) -> N
 
 
 def _dataset(
-    registered_root: Path,
+    registered_root: Path | None,
     unregistered_root: Path,
     *,
     height: int,
     width: int,
     synthetic_prob: float,
     require_registered_targets: bool,
+    fixed_mineral_root: Path | None = None,
 ) -> CartilageDataset:
     return CartilageDataset(
-        str(registered_root),
+        None if registered_root is None else str(registered_root),
         str(unregistered_root),
         size=(height, width),
         image_mode="rgb",
@@ -720,6 +861,9 @@ def _dataset(
         synthetic_seed=17,
         include_group1=False,
         require_registered_targets=require_registered_targets,
+        fixed_mineral_root=(
+            None if fixed_mineral_root is None else str(fixed_mineral_root)
+        ),
     )
 
 
@@ -770,12 +914,17 @@ def assert_dataset_contract(model, device, height: int, width: int) -> None:
             color=(230, 40, 30),
         )
         _write_signal(
+            unregistered / "case" / "case_1.png",
+            shift_x=2,
+            color=(40, 170, 210),
+        )
+        _write_signal(
             unregistered / "case" / "case_4.png",
             shift_x=4,
             color=(230, 40, 30),
         )
 
-        # Deployment needs only registered Mineral and a real moving stain.
+        # The training-compatible default sources fixed Mineral from registered_root.
         deployment_dataset = _dataset(
             mineral_only,
             unregistered,
@@ -800,6 +949,24 @@ def assert_dataset_contract(model, device, height: int, width: int) -> None:
                 group=deployment["group_id"].reshape(1).to(device),
             )
         assert params.shape == (1, 5) and torch.isfinite(params).all()
+
+        root_free_dataset = _dataset(
+            None,
+            unregistered,
+            height=height,
+            width=width,
+            synthetic_prob=0.0,
+            require_registered_targets=False,
+            fixed_mineral_root=unregistered,
+        )
+        root_free = root_free_dataset[0]
+        _assert_sample(root_free, height, width)
+        assert int(root_free["group_id"]) == 2
+        assert torch.count_nonzero(root_free["target_group"]) == 0
+        assert not torch.equal(root_free["fixed_mineral"], deployment["fixed_mineral"])
+        assert root_free_dataset.samples["case"]["mineral"] == str(
+            unregistered / "case" / "case_1.png"
+        )
 
         try:
             _dataset(
@@ -826,8 +993,7 @@ def assert_dataset_contract(model, device, height: int, width: int) -> None:
         )[0]
         _assert_sample(stage2, height, width)
         assert not bool(stage2["has_params"])
-        identity = torch.tensor((0.0, 0.0, 0.0, 1.0, 1.0))
-        assert torch.equal(stage2["params_true"], identity)
+        assert torch.isnan(stage2["params_true"]).all()
         assert not torch.equal(stage2["moving_group"], stage2["target_group"])
 
         # Stage 1 creates moving from target and labels moving -> target.
@@ -1114,7 +1280,7 @@ def _teacher_batch(device: torch.device, height: int, width: int):
             ((True, False, False),), dtype=torch.bool, device=device
         ),
         "group_id": torch.tensor((2,), dtype=torch.long, device=device),
-        "params_true": moving.new_tensor(((0.05, 0.0, 0.0, 1.0, 1.0),)),
+        "params_true": torch.full((1, 5), float("nan"), device=device),
         "has_params": torch.tensor((False,), dtype=torch.bool, device=device),
     }
 
@@ -1187,7 +1353,10 @@ def assert_teacher_student_contract(
             group=batch["group_id"],
         )
         teacher_params = wrapper.forward_teacher(
-            batch["target_group"], batch["moving_group"], batch["group_id"]
+            batch["fixed_mineral"],
+            batch["target_group"],
+            batch["moving_group"],
+            batch["group_id"],
         )
     assert torch.equal(positional, keyword)
     assert positional.shape == teacher_params.shape == (1, 5)
@@ -1210,7 +1379,10 @@ def assert_teacher_student_contract(
     ).to(device)
     try:
         without_teacher.forward_teacher(
-            batch["target_group"], batch["moving_group"], batch["group_id"]
+            batch["fixed_mineral"],
+            batch["target_group"],
+            batch["moving_group"],
+            batch["group_id"],
         )
     except RuntimeError:
         pass
@@ -1223,7 +1395,8 @@ def assert_teacher_student_contract(
         if isinstance(module, FeaturePyramidEncoder)
     ]
     assert len(shared_encoders) == 2
-    supervised = affine_control_point_loss(teacher_params, batch["params_true"])
+    known_params = teacher_params.new_tensor(((0.05, 0.0, 0.0, 1.0, 1.0),))
+    supervised = affine_control_point_loss(teacher_params, known_params)
     assert torch.isfinite(supervised)
 
 
@@ -1268,6 +1441,9 @@ def assert_distillation_contract(device: torch.device, height: int, width: int) 
     _randomize_affine_outputs(wrapper.teacher, -0.10)
     batch = _teacher_batch(device, height, width)
     batch["has_params"] = torch.tensor((True,), dtype=torch.bool, device=device)
+    batch["params_true"] = batch["moving_group"].new_tensor(
+        ((0.05, 0.0, 0.0, 1.0, 1.0),)
+    )
     args = _teacher_loss_args(detach_teacher=True)
     _, components, _ = compute_training_loss(args, wrapper, batch, epoch=1)
     expected_components = {
@@ -1294,11 +1470,32 @@ def assert_distillation_contract(device: torch.device, height: int, width: int) 
 
 
 def assert_teacher_phase_cli_and_validation_contract() -> None:
-    """Exercise CLI defaults and rejected warmup/freeze combinations."""
+    """Accept mixed warmup and reject only structurally invalid phases."""
     defaults = _parse_train_cli()
     assert defaults.teacher_warmup_epochs == 0
     assert defaults.freeze_teacher is False
     validate_args(defaults)
+
+    for synthetic_prob, param_weight in (
+        (0.0, 0.0),
+        (0.0, 2.0),
+        (0.5, 0.0),
+        (0.5, 2.0),
+        (1.0, 0.0),
+        (1.0, 2.0),
+    ):
+        parsed = _parse_train_cli(
+            "--use_teacher_branch",
+            "--teacher_warmup_epochs",
+            "1",
+            "--synthetic_prob",
+            str(synthetic_prob),
+            "--val_synthetic_prob",
+            "0.0",
+            "--param_weight",
+            str(param_weight),
+        )
+        validate_args(parsed)
 
     invalid_cases = (
         (
@@ -1329,10 +1526,20 @@ def assert_teacher_phase_cli_and_validation_contract() -> None:
                 "--use_teacher_branch",
                 "--teacher_warmup_epochs",
                 "1",
-                "--param_weight",
-                "0",
+                "--synthetic_prob",
+                "1.1",
             ),
-            "Teacher-only warmup requires",
+            "synthetic_prob must be in [0, 1]",
+        ),
+        (
+            _parse_train_cli(
+                "--use_teacher_branch",
+                "--teacher_warmup_epochs",
+                "1",
+                "--param_weight",
+                "-0.1",
+            ),
+            "Loss weights cannot be negative",
         ),
     )
     for parsed, expected_message in invalid_cases:
@@ -1387,7 +1594,19 @@ def assert_teacher_only_warmup_contract(
     total, components, _ = compute_training_loss(args, wrapper, batch, epoch=1)
     assert torch.isfinite(total)
     assert "teacher_param" in components
+    assert "teacher_charbonnier" in components
     assert "teacher_distill" not in components
+    student_loss_names = {
+        "student_ncc",
+        "student_edge",
+        "student_charbonnier",
+        "student_gradient",
+        "student_overlap",
+        "student_param",
+        "student_reg",
+        "student_total",
+    }
+    assert student_loss_names.isdisjoint(components)
     assert teacher_distillation_weight(args, 1) == 0.0
     total.backward()
     assert _gradient_sum(wrapper.student) == 0.0
@@ -1411,6 +1630,136 @@ def assert_teacher_only_warmup_contract(
     assert _gradient_sum(wrapper.student) > 0.0
     optimizer.step()
     _assert_parameter_update(wrapper.student, student_before_release)
+
+
+def assert_real_and_mixed_teacher_warmup_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    """Warmup learns from real images and masks affine labels per sample."""
+    args = _teacher_loss_args(detach_teacher=True, warmup_epochs=1)
+    args.ncc_weight = 0.1
+    args.edge_weight = 0.1
+    args.charbonnier_weight = 0.1
+    args.gradient_weight = 0.1
+    args.overlap_weight = 0.1
+    args.param_weight = 0.0
+    args.reg_weight = 0.1
+
+    real_model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    assert real_model.teacher is not None
+    real_batch = _teacher_batch(device, height, width)
+    assert not bool(real_batch["has_params"].any())
+    assert torch.isnan(real_batch["params_true"]).all()
+    assert configure_training_phase(args, real_model, epoch=1) == "teacher_warmup"
+    optimizer = torch.optim.SGD(real_model.parameters(), lr=0.1)
+    student_before = _state_snapshot(real_model.student)
+    teacher_before = _state_snapshot(real_model.teacher)
+    optimizer.zero_grad(set_to_none=True)
+    real_total, real_components, _ = compute_training_loss(
+        args, real_model, real_batch, epoch=1
+    )
+    expected_real_losses = {
+        "teacher_ncc",
+        "teacher_edge",
+        "teacher_charbonnier",
+        "teacher_gradient",
+        "teacher_overlap",
+        "teacher_reg",
+        "teacher_total",
+    }
+    assert expected_real_losses.issubset(real_components)
+    assert "teacher_param" not in real_components
+    assert "teacher_distill" not in real_components
+    assert not any(name.startswith("student_") for name in real_components)
+    assert torch.isfinite(real_total)
+    assert all(torch.isfinite(real_components[name]) for name in expected_real_losses)
+    real_total.backward()
+    assert _gradient_sum(real_model.student) == 0.0
+    assert _gradient_sum(real_model.teacher) > 0.0
+    optimizer.step()
+    _assert_state_unchanged(real_model.student, student_before)
+    _assert_parameter_update(real_model.teacher, teacher_before)
+
+    # A fully real validation loader (val_synthetic_prob=0.0) has no affine
+    # metrics or parameter loss but retains finite image-registration metrics.
+    for path_name, teacher in (("student", False), ("teacher", True)):
+        metrics = evaluate_path(
+            args,
+            real_model,
+            [real_batch],
+            device,
+            path_name=path_name,
+            teacher=teacher,
+        )
+        assert math.isfinite(metrics[f"val_{path_name}_total"])
+        assert f"val_{path_name}_charbonnier" in metrics
+        assert f"val_{path_name}_reg" in metrics
+        assert f"val_{path_name}_param" not in metrics
+        assert not any(
+            name == f"val_{path_name}_{metric_name}"
+            for name in metrics
+            for metric_name in AFFINE_ERROR_METRIC_NAMES
+        )
+
+    args.param_weight = 1.0
+    mixed_model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    assert mixed_model.teacher is not None
+    base_batch = _teacher_batch(device, height, width)
+    mixed_batch = {
+        name: value.repeat((2,) + (1,) * (value.ndim - 1))
+        for name, value in base_batch.items()
+    }
+    mixed_batch["has_params"] = torch.tensor(
+        (True, False), dtype=torch.bool, device=device
+    )
+    params_true = mixed_batch["moving_group"].new_tensor(
+        (0.12, -0.07, math.radians(4.0), 0.96, 1.04)
+    )
+    mixed_batch["params_true"][0] = params_true
+    synthesis = invert_affine_matrix(
+        affine_parameters_to_matrix(params_true.unsqueeze(0))
+    )
+    mixed_batch["moving_group"][:1] = warp_group_with_matrix(
+        mixed_batch["target_group"][:1], synthesis
+    )
+    assert torch.isfinite(mixed_batch["params_true"][0]).all()
+    assert torch.isnan(mixed_batch["params_true"][1]).all()
+    assert configure_training_phase(args, mixed_model, epoch=1) == "teacher_warmup"
+    mixed_model.zero_grad(set_to_none=True)
+    mixed_total, mixed_components, _ = compute_training_loss(
+        args, mixed_model, mixed_batch, epoch=1
+    )
+    expected_mixed_losses = expected_real_losses | {"teacher_param"}
+    assert expected_mixed_losses.issubset(mixed_components)
+    assert "teacher_distill" not in mixed_components
+    assert torch.isfinite(mixed_total)
+    assert all(torch.isfinite(mixed_components[name]) for name in expected_mixed_losses)
+    expected_param = affine_control_point_loss(
+        mixed_model.forward_teacher(
+            fixed_mineral=mixed_batch["fixed_mineral"],
+            target_group=mixed_batch["target_group"],
+            moving_group=mixed_batch["moving_group"],
+            group=mixed_batch["group_id"],
+        )[:1],
+        mixed_batch["params_true"][:1],
+    )
+    torch.testing.assert_close(mixed_components["teacher_param"], expected_param)
+    mixed_total.backward()
+    assert _gradient_sum(mixed_model.student) == 0.0
+    assert _gradient_sum(mixed_model.teacher) > 0.0
+
+    invalid_batch = {name: value.clone() for name, value in real_batch.items()}
+    invalid_batch["has_params"] = torch.ones((1,), dtype=torch.bool, device=device)
+    try:
+        compute_training_loss(args, real_model, invalid_batch, epoch=1)
+    except ValueError as error:
+        assert "has_params=True" in str(error)
+    else:
+        raise AssertionError("Synthetic sample without params_true was accepted")
 
 
 def assert_frozen_teacher_contract(
@@ -1495,10 +1844,131 @@ def assert_frontend_adapter_training_contract(
         total.backward()
         assert wrapper.student.mineral_frontend_adapter is not None
         assert wrapper.student.group_frontend_adapter is not None
+        assert wrapper.teacher.mineral_frontend_adapter is not None
         assert wrapper.teacher.group_frontend_adapter is not None
         assert _module_gradient_sum(wrapper.student.mineral_frontend_adapter) > 0.0
         assert _module_gradient_sum(wrapper.student.group_frontend_adapter) > 0.0
+        assert _module_gradient_sum(wrapper.teacher.mineral_frontend_adapter) > 0.0
         assert _module_gradient_sum(wrapper.teacher.group_frontend_adapter) > 0.0
+
+
+class _KeywordOnlyRecordingStudent(CorrelationVolumeAffineRegistrationModel):
+    """Inference student that rejects positional or extra model inputs."""
+
+    calls: list[dict[str, torch.Tensor]] = []
+
+    def forward(
+        self,
+        *,
+        fixed_mineral: torch.Tensor,
+        moving_group: torch.Tensor,
+        group: torch.Tensor,
+    ) -> torch.Tensor:
+        params = super().forward(
+            fixed_mineral=fixed_mineral,
+            moving_group=moving_group,
+            group=group,
+        )
+        type(self).calls.append(
+            {
+                "fixed_mineral": fixed_mineral.detach().cpu().clone(),
+                "moving_group": moving_group.detach().cpu().clone(),
+                "group": group.detach().cpu().clone(),
+                "params": params.detach().cpu().clone(),
+            }
+        )
+        return params
+
+
+def _run_recorded_inference(
+    *,
+    checkpoint: Path,
+    registered_root: Path | None,
+    unregistered_root: Path,
+    output_dir: Path,
+    eval_with_registered_targets: bool | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    """Run one CPU inference item while recording shared parity helpers."""
+    _KeywordOnlyRecordingStudent.calls = []
+    warp_calls: list[dict[str, object]] = []
+    overlay_calls: list[dict[str, object]] = []
+
+    def recording_warp(moving_group, predicted_params):
+        warped = utils_module.warp_model_space_group(moving_group, predicted_params)
+        warp_calls.append(
+            {
+                "moving_group": moving_group.detach().cpu().clone(),
+                "params": predicted_params.detach().cpu().clone(),
+                "warped_group": warped.detach().cpu().clone(),
+            }
+        )
+        return warped
+
+    def recording_overlay(
+        path,
+        fixed_mineral,
+        warped_group,
+        valid_group,
+        group_id,
+        sfo_mode,
+    ):
+        overlay_calls.append(
+            {
+                "path": Path(path),
+                "fixed_mineral": fixed_mineral.detach().cpu().clone(),
+                "warped_group": warped_group.detach().cpu().clone(),
+                "valid_group": valid_group.detach().cpu().clone(),
+                "group_id": int(group_id),
+                "sfo_mode": str(sfo_mode),
+            }
+        )
+        return utils_module.save_group_overlay(
+            path,
+            fixed_mineral,
+            warped_group,
+            valid_group,
+            group_id,
+            sfo_mode,
+        )
+
+    inference_args = SimpleNamespace(
+        checkpoint=str(checkpoint),
+        registered_root=(None if registered_root is None else str(registered_root)),
+        unregistered_root=str(unregistered_root),
+        output_dir=str(output_dir),
+        batch_size=1,
+        n_workers=0,
+        device="cpu",
+        gpu_ids="0",
+        no_multi_gpu=True,
+        include_group1=False,
+        max_items=0,
+        eval_with_registered_targets=eval_with_registered_targets,
+    )
+    with (
+        mock.patch.object(
+            inference_module,
+            "CorrelationVolumeAffineRegistrationModel",
+            _KeywordOnlyRecordingStudent,
+        ),
+        mock.patch.object(
+            inference_module,
+            "warp_model_space_group",
+            side_effect=recording_warp,
+        ),
+        mock.patch.object(
+            inference_module,
+            "_save_group_overlay",
+            side_effect=recording_overlay,
+        ),
+    ):
+        inference_module.main(inference_args)
+
+    return {
+        "model": list(_KeywordOnlyRecordingStudent.calls),
+        "warp": warp_calls,
+        "overlay": overlay_calls,
+    }
 
 
 def assert_checkpoint_and_overlay_contract(
@@ -1508,6 +1978,9 @@ def assert_checkpoint_and_overlay_contract(
     model = TeacherStudentAffineRegistrationModel(
         student_config=config, use_teacher_branch=True
     ).to(device)
+    assert model.teacher is not None
+    _randomize_affine_outputs(model.student, 0.12)
+    _randomize_affine_outputs(model.teacher, -0.12)
     preprocess = {
         "input_contract_version": "fixed_mineral_moving_group_raw_v1",
         "input_value_range": [0.0, 1.0],
@@ -1543,7 +2016,16 @@ def assert_checkpoint_and_overlay_contract(
         )
         assert full_checkpoint["checkpoint_type"] == "full_training"
         assert "teacher_model_state_dict" in full_checkpoint
+        assert (
+            full_checkpoint["model_config"]["teacher_fixed_input_version"]
+            == TEACHER_FIXED_INPUT_VERSION
+        )
         assert student_checkpoint["checkpoint_type"] == "deployable_student"
+        assert "teacher_fixed_input_version" not in student_checkpoint["model_config"]
+        assert (
+            "teacher_fixed_input_version"
+            not in student_checkpoint["student_model_config"]
+        )
         for checkpoint in (full_checkpoint, student_checkpoint):
             assert checkpoint["student_model_config"]["frontend_mode"] == "structural"
             assert checkpoint["student_model_config"]["group_input_mode"] == "overlay"
@@ -1559,17 +2041,18 @@ def assert_checkpoint_and_overlay_contract(
             "teacher" in key or "optimizer" in key for key in student_checkpoint
         )
 
-        try:
-            load_student_checkpoint(str(full_path))
-        except ValueError as error:
-            assert "student-only" in str(error)
-        else:
-            raise AssertionError("Inference accepted the full teacher checkpoint")
+        full_preprocess, full_config, full_state = load_student_checkpoint(
+            str(full_path)
+        )
         loaded_preprocess, loaded_config, loaded_state = load_student_checkpoint(
             str(student_path)
         )
-        assert loaded_preprocess == preprocess
-        assert loaded_config == config
+        assert full_preprocess == loaded_preprocess == preprocess
+        assert full_config == loaded_config == config
+        assert full_state.keys() == loaded_state.keys()
+        assert all(
+            torch.equal(full_state[name], loaded_state[name]) for name in full_state
+        )
         deployable = CorrelationVolumeAffineRegistrationModel(**loaded_config).to(
             device
         )
@@ -1600,8 +2083,14 @@ def assert_checkpoint_and_overlay_contract(
             for name in model.teacher.state_dict()
         )
 
+        mineral_only = root / "registered_mineral_only"
         registered = root / "registered"
         unregistered = root / "unregistered"
+        _write_signal(
+            mineral_only / "case" / "case_1.png",
+            shift_x=0,
+            color=(210, 210, 210),
+        )
         _write_signal(
             registered / "case" / "case_1.png",
             shift_x=0,
@@ -1611,6 +2100,11 @@ def assert_checkpoint_and_overlay_contract(
             registered / "case" / "case_4.png",
             shift_x=0,
             color=(230, 40, 30),
+        )
+        _write_signal(
+            unregistered / "case" / "case_1.png",
+            shift_x=2,
+            color=(40, 170, 210),
         )
         _write_signal(
             unregistered / "case" / "case_4.png",
@@ -1652,6 +2146,385 @@ def assert_checkpoint_and_overlay_contract(
             pixels = np.asarray(Image.open(images[0]))
             assert pixels.shape == (height, width, 3)
             assert np.count_nonzero(pixels) > 0
+
+        # The deployable inference route must be the exact validation route for
+        # a real item (has_params=False), including target-free deployment.
+        assert tuple(
+            inspect.signature(utils_module.warp_model_space_group).parameters
+        ) == ("moving_group", "predicted_params")
+        assert (
+            inference_module.warp_model_space_group
+            is utils_module.warp_model_space_group
+        )
+        assert (
+            train_module.warp_model_space_group is utils_module.warp_model_space_group
+        )
+        assert (
+            train_module.warp_group_for_supervision
+            is utils_module.warp_group_for_supervision
+        )
+        assert inference_module._save_group_overlay is utils_module.save_group_overlay
+        assert train_module._save_group_overlay is utils_module.save_group_overlay
+
+        deployment_dataset = _dataset(
+            None,
+            unregistered,
+            height=height,
+            width=width,
+            synthetic_prob=0.0,
+            require_registered_targets=False,
+            fixed_mineral_root=unregistered,
+        )
+        assert len(deployment_dataset) == 1
+        assert deployment_dataset.samples["case"]["mineral"] == str(
+            unregistered / "case" / "case_1.png"
+        )
+        assert not torch.equal(
+            deployment_dataset[0]["fixed_mineral"], dataset[0]["fixed_mineral"]
+        )
+        deployment_loader = DataLoader(
+            Subset(deployment_dataset, [0]),
+            batch_size=1,
+            shuffle=False,
+            collate_fn=safe_collate,
+        )
+        parity_student = CorrelationVolumeAffineRegistrationModel(**loaded_config).cpu()
+        parity_student.load_state_dict(loaded_state, strict=True)
+        validation_warp_calls: list[dict[str, torch.Tensor]] = []
+        validation_overlay_calls: list[dict[str, object]] = []
+
+        def recording_validation_warp(moving_group, predicted_params):
+            warped = utils_module.warp_model_space_group(moving_group, predicted_params)
+            validation_warp_calls.append(
+                {
+                    "moving_group": moving_group.detach().cpu().clone(),
+                    "params": predicted_params.detach().cpu().clone(),
+                    "warped_group": warped.detach().cpu().clone(),
+                }
+            )
+            return warped
+
+        def recording_validation_overlay(
+            path,
+            fixed_mineral,
+            warped_group,
+            valid_group,
+            group_id,
+            sfo_mode,
+        ):
+            validation_overlay_calls.append(
+                {
+                    "path": Path(path),
+                    "fixed_mineral": fixed_mineral.detach().cpu().clone(),
+                    "warped_group": warped_group.detach().cpu().clone(),
+                    "valid_group": valid_group.detach().cpu().clone(),
+                    "group_id": int(group_id),
+                    "sfo_mode": str(sfo_mode),
+                }
+            )
+            return utils_module.save_group_overlay(
+                path,
+                fixed_mineral,
+                warped_group,
+                valid_group,
+                group_id,
+                sfo_mode,
+            )
+
+        parity_validation_args = SimpleNamespace(
+            output_dir=str(root / "parity_validation"),
+            use_teacher_branch=False,
+            sfo_mode=preprocess["sfo_mode"],
+        )
+        with (
+            mock.patch.object(
+                train_module,
+                "warp_model_space_group",
+                side_effect=recording_validation_warp,
+            ),
+            mock.patch.object(
+                train_module,
+                "_save_group_overlay",
+                side_effect=recording_validation_overlay,
+            ),
+        ):
+            save_validation_overlays(
+                parity_validation_args,
+                parity_student,
+                deployment_loader,
+                deployment_dataset,
+                [0],
+                torch.device("cpu"),
+            )
+        assert len(validation_warp_calls) == 1
+        assert len(validation_overlay_calls) == 1
+
+        target_free_output = root / "parity_inference_target_free"
+        diagnostic_output = root / "parity_inference_diagnostic"
+        target_free = _run_recorded_inference(
+            checkpoint=full_path,
+            registered_root=None,
+            unregistered_root=unregistered,
+            output_dir=target_free_output,
+        )
+        diagnostic = _run_recorded_inference(
+            checkpoint=full_path,
+            registered_root=registered,
+            unregistered_root=unregistered,
+            output_dir=diagnostic_output,
+        )
+
+        def only_call(records, name):
+            calls = records[name]
+            assert len(calls) == 1, (name, len(calls))
+            return calls[0]
+
+        target_free_model = only_call(target_free, "model")
+        target_free_warp = only_call(target_free, "warp")
+        target_free_overlay = only_call(target_free, "overlay")
+        diagnostic_model = only_call(diagnostic, "model")
+        diagnostic_warp = only_call(diagnostic, "warp")
+        diagnostic_overlay = only_call(diagnostic, "overlay")
+        validation_warp = validation_warp_calls[0]
+        validation_overlay = validation_overlay_calls[0]
+
+        # The keyword-only subclass makes any positional call, wrong keyword,
+        # or accidental target_group model input fail before producing output.
+        assert torch.equal(
+            target_free_model["moving_group"], target_free_warp["moving_group"]
+        )
+        assert torch.equal(target_free_model["params"], target_free_warp["params"])
+        direct_real_warp = utils_module.warp_model_space_group(
+            target_free_warp["moving_group"],
+            target_free_warp["params"],
+        )
+        assert torch.equal(target_free_warp["warped_group"], direct_real_warp)
+        identity = target_free_warp["params"].new_tensor(((0.0, 0.0, 0.0, 1.0, 1.0),))
+        assert not torch.equal(target_free_warp["params"], identity)
+
+        assert torch.equal(
+            target_free_overlay["fixed_mineral"],
+            target_free_model["fixed_mineral"][0],
+        )
+        assert torch.equal(
+            target_free_overlay["warped_group"],
+            target_free_warp["warped_group"][0],
+        )
+        assert target_free_overlay["group_id"] == int(target_free_model["group"][0])
+        assert target_free_overlay["group_id"] == 2
+        assert target_free_overlay["sfo_mode"] == preprocess["sfo_mode"]
+        expected_model_space_path = (
+            target_free_output / "model_space_group_overlays" / "00000_case_G2.png"
+        )
+        assert target_free_overlay["path"] == expected_model_space_path
+        assert expected_model_space_path.is_file()
+
+        # Training validation and deployable inference receive identical real
+        # tensors and predictions, then invoke the same shared warp and overlay.
+        for key in ("moving_group", "params", "warped_group"):
+            assert torch.equal(target_free_warp[key], validation_warp[key]), key
+        for key in (
+            "fixed_mineral",
+            "warped_group",
+            "valid_group",
+        ):
+            assert torch.equal(target_free_overlay[key], validation_overlay[key]), key
+        assert target_free_overlay["group_id"] == validation_overlay["group_id"]
+        assert target_free_overlay["sfo_mode"] == validation_overlay["sfo_mode"]
+
+        # Loading registered targets for optional metrics must not alter any
+        # student input, prediction, real warp, or model-space visualization.
+        for key in ("fixed_mineral", "moving_group", "group", "params"):
+            assert torch.equal(target_free_model[key], diagnostic_model[key]), key
+        for key in ("moving_group", "params", "warped_group"):
+            assert torch.equal(target_free_warp[key], diagnostic_warp[key]), key
+        for key in (
+            "fixed_mineral",
+            "warped_group",
+            "valid_group",
+        ):
+            assert torch.equal(target_free_overlay[key], diagnostic_overlay[key]), key
+        assert target_free_overlay["group_id"] == diagnostic_overlay["group_id"]
+        assert target_free_overlay["sfo_mode"] == diagnostic_overlay["sfo_mode"]
+
+        def read_rgb(path):
+            with Image.open(path) as image:
+                return np.asarray(image.convert("RGB")).copy()
+
+        validation_pixels = read_rgb(validation_overlay["path"])
+        target_free_pixels = read_rgb(target_free_overlay["path"])
+        diagnostic_pixels = read_rgb(diagnostic_overlay["path"])
+        assert validation_pixels.shape == (height, width, 3)
+        assert np.array_equal(target_free_pixels, validation_pixels)
+        assert np.array_equal(diagnostic_pixels, target_free_pixels)
+        assert not (target_free_output / "registered_target_metrics.csv").exists()
+        assert (diagnostic_output / "registered_target_metrics.csv").is_file()
+
+        # Stage-1 parity uses one literal full checkpoint and one identical
+        # deterministic synthetic dataset item for both rendering paths.
+        stage1_dataset = _dataset(
+            registered,
+            unregistered,
+            height=height,
+            width=width,
+            synthetic_prob=1.0,
+            require_registered_targets=True,
+        )
+        stage1_batch = safe_collate([stage1_dataset[0]])
+        assert bool(stage1_batch["has_params"].all())
+        stage1_validation_warps = []
+        stage1_validation_overlays = []
+
+        def record_stage1_validation_warp(moving_group, predicted_params):
+            warped = utils_module.warp_model_space_group(moving_group, predicted_params)
+            stage1_validation_warps.append(
+                {
+                    "moving_group": moving_group.detach().cpu().clone(),
+                    "params": predicted_params.detach().cpu().clone(),
+                    "warped_group": warped.detach().cpu().clone(),
+                }
+            )
+            return warped
+
+        def record_stage1_validation_overlay(
+            path,
+            fixed_mineral,
+            warped_group,
+            valid_group,
+            group_id,
+            sfo_mode,
+        ):
+            stage1_validation_overlays.append(
+                {
+                    "path": Path(path),
+                    "fixed_mineral": fixed_mineral.detach().cpu().clone(),
+                    "warped_group": warped_group.detach().cpu().clone(),
+                    "valid_group": valid_group.detach().cpu().clone(),
+                    "group_id": int(group_id),
+                    "sfo_mode": str(sfo_mode),
+                }
+            )
+            return utils_module.save_group_overlay(
+                path,
+                fixed_mineral,
+                warped_group,
+                valid_group,
+                group_id,
+                sfo_mode,
+            )
+
+        stage1_validation_args = SimpleNamespace(
+            output_dir=str(root / "stage1_exact_validation"),
+            use_teacher_branch=False,
+            sfo_mode=preprocess["sfo_mode"],
+        )
+        with (
+            mock.patch.object(
+                train_module,
+                "warp_model_space_group",
+                side_effect=record_stage1_validation_warp,
+            ),
+            mock.patch.object(
+                train_module,
+                "_save_group_overlay",
+                side_effect=record_stage1_validation_overlay,
+            ),
+        ):
+            save_validation_overlays(
+                stage1_validation_args,
+                restored,
+                [stage1_batch],
+                stage1_dataset,
+                [0],
+                device,
+            )
+        assert len(stage1_validation_warps) == 1
+        assert len(stage1_validation_overlays) == 1
+
+        same_preprocess, same_config, same_state = load_student_checkpoint(
+            str(full_path)
+        )
+        assert same_preprocess == preprocess
+        stage1_inference_model = CorrelationVolumeAffineRegistrationModel(
+            **same_config
+        ).to(device)
+        stage1_inference_model.load_state_dict(same_state, strict=True)
+        stage1_inference_model.eval()
+        stage1_inference_batch = train_module.move_required_tensors(
+            stage1_batch, device
+        )
+        stage1_inference_warps = []
+
+        def record_stage1_inference_warp(moving_group, predicted_params):
+            warped = utils_module.warp_model_space_group(moving_group, predicted_params)
+            stage1_inference_warps.append(
+                {
+                    "moving_group": moving_group.detach().cpu().clone(),
+                    "params": predicted_params.detach().cpu().clone(),
+                    "warped_group": warped.detach().cpu().clone(),
+                }
+            )
+            return warped
+
+        with (
+            torch.no_grad(),
+            mock.patch.object(
+                inference_module,
+                "warp_model_space_group",
+                side_effect=record_stage1_inference_warp,
+            ),
+        ):
+            stage1_params, stage1_warped = inference_module.predict_model_space_group(
+                stage1_inference_model, stage1_inference_batch
+            )
+        assert len(stage1_inference_warps) == 1
+        validation_warp = stage1_validation_warps[0]
+        inference_warp = stage1_inference_warps[0]
+        for key in ("moving_group", "params", "warped_group"):
+            assert torch.equal(validation_warp[key], inference_warp[key]), key
+        assert tuple(stage1_warped.shape) == tuple(stage1_batch["moving_group"].shape)
+        torch.testing.assert_close(
+            stage1_params.detach().cpu(), validation_warp["params"], atol=0, rtol=0
+        )
+
+        stage1_overlay = stage1_validation_overlays[0]
+        stage1_inference_overlay_path = (
+            root / "stage1_exact_inference" / stage1_overlay["path"].name
+        )
+        stage1_inference_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        inference_module._save_group_overlay(
+            str(stage1_inference_overlay_path),
+            stage1_inference_batch["fixed_mineral"][0],
+            stage1_warped[0],
+            stage1_inference_batch["valid_group"][0],
+            int(stage1_inference_batch["group_id"][0]),
+            preprocess["sfo_mode"],
+        )
+        assert torch.equal(
+            stage1_overlay["fixed_mineral"],
+            stage1_inference_batch["fixed_mineral"][0].detach().cpu(),
+        )
+        assert torch.equal(
+            stage1_overlay["warped_group"], stage1_warped[0].detach().cpu()
+        )
+        assert torch.equal(
+            stage1_overlay["valid_group"],
+            stage1_inference_batch["valid_group"][0].detach().cpu(),
+        )
+        assert stage1_overlay["group_id"] == int(stage1_inference_batch["group_id"][0])
+        assert np.array_equal(
+            read_rgb(stage1_overlay["path"]),
+            read_rgb(stage1_inference_overlay_path),
+        )
+
+        supervision_only_warp = utils_module.warp_group_for_supervision(
+            stage1_inference_batch["moving_group"],
+            stage1_inference_batch["target_group"],
+            stage1_params,
+            stage1_inference_batch["params_true"],
+            stage1_inference_batch["has_params"],
+        )
+        assert not torch.equal(stage1_warped, supervision_only_warp)
 
 
 def assert_frontend_checkpoint_contract(
@@ -2067,15 +2940,17 @@ def assert_full_source_supervision_contract(
     assert float(differentiable_prediction.grad.abs().sum()) > 0.0
 
     mixed_has_params = torch.tensor((True, False), dtype=torch.bool, device=device)
+    mixed_params_true = params_true.clone()
+    mixed_params_true[1] = float("nan")
     sources, matrices = supervision_source_and_matrices(
-        moving, target, predicted, params_true, mixed_has_params
+        moving, target, predicted, mixed_params_true, mixed_has_params
     )
     assert torch.equal(sources[0], target[0])
     assert torch.equal(sources[1], moving[1])
     torch.testing.assert_close(matrices[0], composed[0])
     torch.testing.assert_close(matrices[1], predicted_matrix[1])
     mixed_warp = warp_group_for_supervision(
-        moving, target, predicted, params_true, mixed_has_params
+        moving, target, predicted, mixed_params_true, mixed_has_params
     )
     expected_mixed_warp = torch.cat(
         (
@@ -2088,8 +2963,9 @@ def assert_full_source_supervision_contract(
 
     # Real Stage 2 has no synthesis matrix and remains the original direct warp.
     real_only = torch.zeros((2,), dtype=torch.bool, device=device)
+    real_params_true = torch.full_like(params_true, float("nan"))
     stage2_warp = warp_group_for_supervision(
-        moving, target, predicted, params_true, real_only
+        moving, target, predicted, real_params_true, real_only
     )
     direct_warp = warp_group(moving, predicted)
     torch.testing.assert_close(stage2_warp, direct_warp, atol=0.0, rtol=0.0)
@@ -2102,7 +2978,7 @@ def assert_full_source_supervision_contract(
         target,
         valid,
         predicted,
-        params_true=params_true,
+        params_true=mixed_params_true,
         has_params=mixed_has_params,
     )
     synthetic_overlap = build_group_valid_overlap(
@@ -2118,7 +2994,7 @@ def assert_full_source_supervision_contract(
         target[1:],
         valid[1:],
         predicted[1:],
-        params_true=params_true[1:],
+        params_true=mixed_params_true[1:],
         has_params=mixed_has_params[1:],
     )
     assert not overlap.requires_grad
@@ -2261,6 +3137,7 @@ def main(args: argparse.Namespace) -> None:
     assert_coarse_affine_and_composition_contract(device)
     assert_structural_frontend_compatibility(device, args.height, args.width)
     assert_frontend_forward_matrix(device, args.height, args.width)
+    assert_teacher_mineral_fusion_contract(device, args.height, args.width)
     assert_raw_and_hybrid_frontend_contract(device, args.height, args.width)
     student = CorrelationVolumeAffineRegistrationModel(**build_config()).to(device)
     assert_no_enhancement_contract()
@@ -2271,6 +3148,7 @@ def main(args: argparse.Namespace) -> None:
     assert_teacher_student_contract(device, args.height, args.width)
     assert_distillation_contract(device, args.height, args.width)
     assert_teacher_only_warmup_contract(device, args.height, args.width)
+    assert_real_and_mixed_teacher_warmup_contract(device, args.height, args.width)
     assert_frozen_teacher_contract(device, args.height, args.width)
     assert_frontend_adapter_training_contract(device, args.height, args.width)
     assert_checkpoint_and_overlay_contract(device, args.height, args.width)

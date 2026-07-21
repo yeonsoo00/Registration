@@ -3,8 +3,8 @@
 The deployable student consumes registered Mineral and unregistered grouped
 stains through a structural, raw, or concatenated hybrid frontend. Registered
 target stains never enter the student or inference path. An optional independent
-training-only teacher instead compares registered and moving versions of the
-same group. Within each branch, learnable domain adapters (when needed) feed
+training-only teacher compares the moving group against a validity-aware fusion
+of registered Mineral and the registered version of the same group. Within each branch, learnable domain adapters (when needed) feed
 one weight-shared CNN/FPN, so both sides of every cost volume occupy the same
 feature space. At every selected pyramid level, the model builds an explicit
 local cost volume
@@ -47,6 +47,7 @@ FRONTEND_MODES = ("structural", "raw", "hybrid")
 GROUP_INPUT_MODES = ("stack", "overlay")
 AFFINE_HEAD_MODES = ("joint", "separated", "separated_residual")
 DEFAULT_GROUP_SLOTS = 3
+TEACHER_FIXED_INPUT_VERSION = "mineral_target_validity_mean_v1"
 
 
 def canonicalize_model_config(config: dict | None) -> dict:
@@ -1851,18 +1852,83 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             adapt_fixed_group=False,
         )
 
+    def fuse_teacher_fixed_representations(
+        self,
+        target_representation: torch.Tensor,
+        mineral_representation: torch.Tensor,
+        target_valid: torch.Tensor,
+        mineral_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse the teacher registered-group and Mineral fixed evidence.
+
+        The evidence-aware mean preserves either source where it is the only
+        valid source and averages them where both are valid. This operation is
+        deliberately parameter-free so existing teacher checkpoints retain
+        exactly the same state-dict contract.
+        """
+        if tuple(target_representation.shape) != tuple(mineral_representation.shape):
+            raise ValueError(
+                "Teacher target and Mineral representations must have identical "
+                "BxCxHxW shapes"
+            )
+        expected_valid_shape = (
+            target_representation.shape[0],
+            1,
+            target_representation.shape[-2],
+            target_representation.shape[-1],
+        )
+        if tuple(target_valid.shape) != expected_valid_shape:
+            raise ValueError(
+                "target_valid must match the representation batch and spatial shape"
+            )
+        if tuple(mineral_valid.shape) != expected_valid_shape:
+            raise ValueError(
+                "mineral_valid must match the representation batch and spatial shape"
+            )
+
+        target_weight = target_valid.to(dtype=target_representation.dtype)
+        mineral_weight = mineral_valid.to(dtype=target_representation.dtype)
+        denominator = (target_weight + mineral_weight).clamp_min(1.0)
+        fused = (
+            target_representation * target_weight
+            + mineral_representation * mineral_weight
+        ) / denominator
+        fused_valid = target_valid.bool() | mineral_valid.bool()
+        return fused * fused_valid.to(dtype=fused.dtype), fused_valid
+
+    def teacher_fixed_frontend_representation(
+        self,
+        fixed_mineral: torch.Tensor,
+        target_group: torch.Tensor,
+        group_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the teacher fixed side from Mineral and registered targets."""
+        target_representation, target_valid = self.group_frontend_representation(
+            target_group.float(), group_ids
+        )
+        mineral_representation, mineral_valid = self.mineral_frontend_representation(
+            fixed_mineral.float()
+        )
+        return self.fuse_teacher_fixed_representations(
+            target_representation,
+            mineral_representation,
+            target_valid,
+            mineral_valid,
+        )
+
     def forward_group_pair(
         self,
+        fixed_mineral: torch.Tensor,
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict from registered and moving versions of the same stain group.
+        """Predict from Mineral, registered targets, and the moving group.
 
         This method is training-only. It is intentionally not called by the
         deployable student forward path.
         """
-        batch_size, _, _, _, _ = self._validate_group_stack(
+        batch_size, _, channels, height, width = self._validate_group_stack(
             moving_group, "moving_group"
         )
         self._validate_group_stack(target_group, "target_group")
@@ -1872,19 +1938,26 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             )
         if target_group.device != moving_group.device:
             raise ValueError("target_group and moving_group must share one device")
+        self._validate_fixed_mineral(
+            fixed_mineral,
+            expected_shape=(batch_size, channels, height, width),
+            device=moving_group.device,
+        )
         group_ids = self._validate_group_ids(
             group, batch_size=batch_size, device=moving_group.device
         )
-        target_representation, target_valid = self.group_frontend_representation(
-            target_group.float(), group_ids
+        fixed_representation, fixed_valid = self.teacher_fixed_frontend_representation(
+            fixed_mineral,
+            target_group,
+            group_ids,
         )
         moving_representation, moving_valid = self.group_frontend_representation(
             moving_group.float(), group_ids
         )
         return self._predict_from_representations(
-            fixed_representation=target_representation,
+            fixed_representation=fixed_representation,
             moving_representation=moving_representation,
-            fixed_valid=target_valid,
+            fixed_valid=fixed_valid,
             moving_valid=moving_valid,
             group_ids=group_ids,
             adapt_fixed_group=True,
@@ -1902,11 +1975,17 @@ class GroupPairCorrelationVolumeAffineRegistrationModel(
 
     def forward(
         self,
+        fixed_mineral: torch.Tensor,
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_group_pair(target_group, moving_group, group)
+        return self.forward_group_pair(
+            fixed_mineral,
+            target_group,
+            moving_group,
+            group,
+        )
 
 
 class TeacherStudentAffineRegistrationModel(nn.Module):
@@ -1954,16 +2033,17 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
 
     def forward_teacher(
         self,
+        fixed_mineral: torch.Tensor,
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the training-only same-group teacher path."""
+        """Run the training-only Mineral + same-group teacher path."""
         if self.teacher is None:
             raise RuntimeError(
                 "Teacher branch is disabled; construct with use_teacher_branch=True"
             )
-        return self.teacher(target_group, moving_group, group)
+        return self.teacher(fixed_mineral, target_group, moving_group, group)
 
 
 # A short compatibility alias keeps external scripts that expect the original
@@ -1988,6 +2068,7 @@ __all__ = [
     "SeparatedAffineHead",
     "SeparatedResidualAffineHead",
     "STRUCTURAL_CHANNEL_NAMES",
+    "TEACHER_FIXED_INPUT_VERSION",
     "STRUCTURAL_DESCRIPTOR_VERSION",
     "STRUCTURAL_EVIDENCE_EPSILON",
     "TeacherStudentAffineRegistrationModel",

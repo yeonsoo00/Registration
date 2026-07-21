@@ -572,6 +572,189 @@ def apply_affine_transform(
     )
 
 
+def warp_group_with_matrix(
+    moving_group: torch.Tensor,
+    matrices: torch.Tensor,
+) -> torch.Tensor:
+    """Warp every stain slot with one explicit affine-grid matrix per item."""
+    if moving_group.ndim != 5:
+        raise ValueError(
+            "moving_group must have shape BxKxCxHxW, got "
+            f"{tuple(moving_group.shape)}"
+        )
+    batch_size, slots, channels, height, width = moving_group.shape
+    if tuple(matrices.shape) != (batch_size, 2, 3):
+        raise ValueError(
+            f"matrices must have shape {(batch_size, 2, 3)}, got "
+            f"{tuple(matrices.shape)}"
+        )
+    repeated_matrices = matrices[:, None].expand(batch_size, slots, 2, 3)
+    flattened = moving_group.reshape(batch_size * slots, channels, height, width)
+    warped = apply_affine_transform(
+        flattened,
+        repeated_matrices.reshape(batch_size * slots, 2, 3),
+    )
+    return warped.reshape(batch_size, slots, channels, height, width)
+
+
+def warp_model_space_group(
+    moving_group: torch.Tensor,
+    predicted_params: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the canonical deployable model-space warp to a grouped tensor."""
+    return warp_group_with_matrix(
+        moving_group,
+        affine_parameters_to_matrix(predicted_params),
+    )
+
+
+def warp_group(moving_group: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    """Backward-compatible alias for the canonical model-space group warp."""
+    return warp_model_space_group(moving_group, params)
+
+
+def synthetic_full_correction_matrices(
+    predicted_params: torch.Tensor,
+    params_true: torch.Tensor,
+) -> torch.Tensor:
+    """Compose prediction and known synthesis for a one-pass source warp."""
+    if predicted_params.shape != params_true.shape:
+        raise ValueError(
+            "predicted_params and params_true must have identical shapes; got "
+            f"{tuple(predicted_params.shape)} and {tuple(params_true.shape)}"
+        )
+    predicted_matrix = affine_parameters_to_matrix(predicted_params)
+    registration_matrix = affine_parameters_to_matrix(params_true)
+    synthesis_matrix = invert_affine_matrix(registration_matrix)
+    return compose_affine_grid_warps(synthesis_matrix, predicted_matrix)
+
+
+def supervision_source_and_matrices(
+    moving_group: torch.Tensor,
+    target_group: torch.Tensor,
+    params: torch.Tensor,
+    params_true: torch.Tensor,
+    has_params: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select one-pass synthetic or ordinary real supervision geometry.
+
+    Synthetic items use the original registered ``target_group`` with
+    ``A_syn @ A_pred``. Real items have no known synthesis transform, so they
+    retain ``warp(moving_group, A_pred)``. Selection is per item, allowing
+    mixed batches while keeping targets out of prediction.
+    """
+    if moving_group.shape != target_group.shape:
+        raise ValueError(
+            "moving_group and target_group must have identical shapes; got "
+            f"{tuple(moving_group.shape)} and {tuple(target_group.shape)}"
+        )
+    batch_size = moving_group.shape[0]
+    if tuple(params.shape) != (batch_size, 5):
+        raise ValueError(
+            f"params must have shape {(batch_size, 5)}, got {tuple(params.shape)}"
+        )
+    if tuple(params_true.shape) != (batch_size, 5):
+        raise ValueError(
+            "params_true must have the same Bx5 shape as params; got "
+            f"{tuple(params_true.shape)}"
+        )
+    synthetic_items = has_params.reshape(-1).bool()
+    if synthetic_items.numel() != batch_size:
+        raise ValueError(
+            f"has_params must contain {batch_size} values, got "
+            f"{synthetic_items.numel()}"
+        )
+
+    predicted_matrices = affine_parameters_to_matrix(params)
+    if not synthetic_items.any():
+        return moving_group, predicted_matrices
+
+    synthetic_params_true = params_true[synthetic_items]
+    if not torch.isfinite(synthetic_params_true).all():
+        raise ValueError("Every has_params=True sample must provide finite params_true")
+    synthetic_matrices = synthetic_full_correction_matrices(
+        params[synthetic_items], synthetic_params_true
+    )
+    matrices = predicted_matrices.clone()
+    matrices[synthetic_items] = synthetic_matrices
+    source_mask = synthetic_items.view(batch_size, 1, 1, 1, 1)
+    sources = torch.where(source_mask, target_group, moving_group)
+    return sources, matrices
+
+
+def warp_group_for_supervision(
+    moving_group: torch.Tensor,
+    target_group: torch.Tensor,
+    params: torch.Tensor,
+    params_true: torch.Tensor,
+    has_params: torch.Tensor,
+) -> torch.Tensor:
+    """Correct synthetic sources once and real moving images normally."""
+    sources, matrices = supervision_source_and_matrices(
+        moving_group,
+        target_group,
+        params,
+        params_true,
+        has_params,
+    )
+    return warp_group_with_matrix(sources, matrices)
+
+
+def _hsv_to_rgb(image: np.ndarray) -> np.ndarray:
+    """Convert a normalized H/S/V image to RGB for a readable overlay."""
+    hue = (image[..., 0] % 1.0) * 6.0
+    saturation = np.clip(image[..., 1], 0.0, 1.0)
+    value = np.clip(image[..., 2], 0.0, 1.0)
+    sector = np.floor(hue).astype(np.int64) % 6
+    fraction = hue - np.floor(hue)
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - fraction * saturation)
+    t = value * (1.0 - (1.0 - fraction) * saturation)
+    candidates = (
+        np.stack((value, t, p), axis=-1),
+        np.stack((q, value, p), axis=-1),
+        np.stack((p, value, t), axis=-1),
+        np.stack((p, q, value), axis=-1),
+        np.stack((t, p, value), axis=-1),
+        np.stack((value, p, q), axis=-1),
+    )
+    rgb = np.zeros_like(image)
+    for index, candidate in enumerate(candidates):
+        rgb[sector == index] = candidate[sector == index]
+    return rgb
+
+
+def _to_display_rgb(
+    image: torch.Tensor,
+    group_id: int,
+    sfo_mode: str,
+) -> np.ndarray:
+    """Convert one normalized model-space tensor to display RGB."""
+    display = image.detach().float().clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy()
+    if group_id == 5 and sfo_mode == "hsv":
+        display = _hsv_to_rgb(display)
+    return np.clip(display, 0.0, 1.0)
+
+
+def save_group_overlay(
+    path: str,
+    fixed_mineral: torch.Tensor,
+    warped_group: torch.Tensor,
+    valid_group: torch.Tensor,
+    group_id: int,
+    sfo_mode: str,
+) -> None:
+    """Save the validation-style model-space Mineral/group screen overlay."""
+    components = [_to_display_rgb(fixed_mineral, 1, "rgb")]
+    for slot, is_valid in enumerate(valid_group.tolist()):
+        if is_valid:
+            components.append(_to_display_rgb(warped_group[slot], group_id, sfo_mode))
+    stacked = np.stack(components, axis=0)
+    overlay = 1.0 - np.prod(1.0 - stacked, axis=0)
+    pixels = np.rint(np.clip(overlay, 0.0, 1.0) * 255.0).astype(np.uint8)
+    Image.fromarray(pixels, mode="RGB").save(path)
+
+
 def sample_registration_parameters(
     tx_range: Tuple[float, float],
     ty_range: Tuple[float, float],

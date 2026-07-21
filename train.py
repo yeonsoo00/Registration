@@ -11,13 +11,13 @@ import argparse
 import os
 import random
 import re
+import warnings
 from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -36,15 +36,21 @@ from models import (
     DEFAULT_GROUP_SLOTS,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
+    TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
     canonicalize_model_config,
 )
 from utils import (
     affine_parameters_to_matrix,
     apply_affine_transform,
-    compose_affine_grid_warps,
-    invert_affine_matrix,
     resolve_device,
+    save_group_overlay as _save_group_overlay,
+    supervision_source_and_matrices,
+    synthetic_full_correction_matrices,
+    warp_group,
+    warp_group_for_supervision,
+    warp_group_with_matrix,
+    warp_model_space_group,
 )
 
 
@@ -203,8 +209,9 @@ def parse_args():
         type=int,
         default=0,
         help=(
-            "Train only the teacher for epochs 1..N; the student is frozen and "
-            "distillation starts at epoch N+1"
+            "Train only the teacher for epochs 1..N using image losses on all "
+            "samples and affine labels only where has_params=True; the student "
+            "is frozen and distillation starts at epoch N+1"
         ),
     )
     p.add_argument(
@@ -368,114 +375,6 @@ def split_by_sample(
     return train_indices, validation_indices, training_ids, validation_ids
 
 
-def warp_group_with_matrix(moving, matrices):
-    """Warp every group slot with one explicit affine-grid matrix per item."""
-    if moving.ndim != 5:
-        raise ValueError(f"moving must have shape BxKxCxHxW, got {moving.shape}")
-    batch_size, slots, channels, height, width = moving.shape
-    if tuple(matrices.shape) != (batch_size, 2, 3):
-        raise ValueError(
-            f"matrices must have shape {(batch_size, 2, 3)}, got "
-            f"{tuple(matrices.shape)}"
-        )
-    matrices = matrices[:, None].expand(batch_size, slots, 2, 3)
-    matrices = matrices.reshape(batch_size * slots, 2, 3)
-    flattened = moving.reshape(batch_size * slots, channels, height, width)
-    warped = apply_affine_transform(flattened, matrices)
-    return warped.reshape(batch_size, slots, channels, height, width)
-
-
-def warp_group(moving, params):
-    """Warp all stains in a group with the same predicted affine."""
-    return warp_group_with_matrix(moving, affine_parameters_to_matrix(params))
-
-
-def synthetic_full_correction_matrices(predicted_params, params_true):
-    """Compose prediction and known synthesis for a one-pass source warp.
-
-    Synthetic moving data are generated as ``warp(target, A_syn)`` where
-    ``A_syn = inverse(matrix(params_true))``. Correcting that intermediate with
-    ``A_pred`` is therefore equivalent to warping the untouched target once
-    with ``A_syn @ A_pred``. The composed matrix remains explicit because an
-    anisotropic affine composition need not fit the five-parameter form.
-    """
-    if predicted_params.shape != params_true.shape:
-        raise ValueError(
-            "predicted_params and params_true must have identical shapes; got "
-            f"{tuple(predicted_params.shape)} and {tuple(params_true.shape)}"
-        )
-    predicted_matrix = affine_parameters_to_matrix(predicted_params)
-    registration_matrix = affine_parameters_to_matrix(params_true)
-    synthesis_matrix = invert_affine_matrix(registration_matrix)
-    return compose_affine_grid_warps(synthesis_matrix, predicted_matrix)
-
-
-def supervision_source_and_matrices(
-    moving_group,
-    target_group,
-    params,
-    params_true,
-    has_params,
-):
-    """Select one-pass synthetic or ordinary real supervision geometry.
-
-    Synthetic items use the original registered ``target_group`` with
-    ``A_syn @ A_pred``. Real Stage-2 items have no known synthesis transform,
-    so they retain ``warp(moving_group, A_pred)``. Selection is per item, which
-    also supports mixed synthetic/real batches without changing the dataset.
-    """
-    if moving_group.shape != target_group.shape:
-        raise ValueError(
-            "moving_group and target_group must have identical shapes; got "
-            f"{tuple(moving_group.shape)} and {tuple(target_group.shape)}"
-        )
-    batch_size = moving_group.shape[0]
-    if tuple(params.shape) != (batch_size, 5):
-        raise ValueError(
-            f"params must have shape {(batch_size, 5)}, got {tuple(params.shape)}"
-        )
-    if tuple(params_true.shape) != (batch_size, 5):
-        raise ValueError(
-            "params_true must have the same Bx5 shape as params; got "
-            f"{tuple(params_true.shape)}"
-        )
-    synthetic_items = has_params.reshape(-1).bool()
-    if synthetic_items.numel() != batch_size:
-        raise ValueError(
-            f"has_params must contain {batch_size} values, got "
-            f"{synthetic_items.numel()}"
-        )
-
-    predicted_matrices = affine_parameters_to_matrix(params)
-    if not synthetic_items.any():
-        return moving_group, predicted_matrices
-
-    full_matrices = synthetic_full_correction_matrices(params, params_true)
-    source_mask = synthetic_items.view(batch_size, 1, 1, 1, 1)
-    matrix_mask = synthetic_items.view(batch_size, 1, 1)
-    sources = torch.where(source_mask, target_group, moving_group)
-    matrices = torch.where(matrix_mask, full_matrices, predicted_matrices)
-    return sources, matrices
-
-
-def warp_group_for_supervision(
-    moving_group,
-    target_group,
-    params,
-    params_true,
-    has_params,
-):
-    """Correct synthetic sources once and real moving images normally."""
-    sources, matrices = supervision_source_and_matrices(
-        moving_group,
-        target_group,
-        params,
-        params_true,
-        has_params,
-    )
-    return warp_group_with_matrix(sources, matrices)
-
-
 def affine_error_metrics(params, params_true, height, width):
     """Return interpretable affine errors for labeled model-space transforms.
 
@@ -616,6 +515,26 @@ def build_group_valid_overlap(
     return (warped_source_support * target_support).clamp(0.0, 1.0).detach()
 
 
+def parameter_supervision_mask(params, params_true, has_params):
+    """Validate and return the per-sample affine-label availability mask."""
+    if params.ndim != 2 or params.shape[1] != 5:
+        raise ValueError(f"params must have shape Bx5, got {tuple(params.shape)}")
+    batch_size = params.shape[0]
+    if tuple(params_true.shape) != (batch_size, 5):
+        raise ValueError(
+            f"params_true must have shape {(batch_size, 5)}, got "
+            f"{tuple(params_true.shape)}"
+        )
+    mask = has_params.reshape(-1).bool()
+    if mask.numel() != batch_size:
+        raise ValueError(
+            f"has_params must contain {batch_size} values, got {mask.numel()}"
+        )
+    if mask.any() and not torch.isfinite(params_true[mask]).all():
+        raise ValueError("Every has_params=True sample must provide finite params_true")
+    return mask
+
+
 def grouped_loss(
     a,
     *,
@@ -686,7 +605,7 @@ def grouped_loss(
             weight=overlap_valid[sparse_mask],
         )
 
-    has_parameters = has_params.reshape(-1).bool()
+    has_parameters = parameter_supervision_mask(params, params_true, has_params)
     if a.param_weight and has_parameters.any():
         losses["param"] = affine_control_point_loss(
             params[has_parameters], params_true[has_parameters]
@@ -716,7 +635,7 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
         raise ValueError("Teacher evaluation requested while its branch is disabled")
     model.eval()
     sums = {}
-    sample_count = 0
+    metric_counts = {}
     affine_metric_sums = {name: 0.0 for name in AFFINE_ERROR_METRIC_NAMES}
     affine_metric_count = 0
     group_sums = {group_id: 0.0 for group_id in range(1, 6)}
@@ -727,6 +646,7 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
             batch = move_required_tensors(batch, device)
             if teacher:
                 params = model.forward_teacher(
+                    fixed_mineral=batch["fixed_mineral"],
                     target_group=batch["target_group"],
                     moving_group=batch["moving_group"],
                     group=batch["group_id"],
@@ -764,15 +684,27 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
                 valid_overlap=valid_overlap,
             )
             batch_size = params.shape[0]
+            has_parameters = parameter_supervision_mask(
+                params, batch["params_true"], batch["has_params"]
+            )
+            labeled_count = int(has_parameters.sum())
+            unlabeled_count = batch_size - labeled_count
             for name, value in losses.items():
                 metric_name = f"val_{path_name}_{name}"
+                if name == "param":
+                    metric_count = labeled_count
+                elif name == "reg":
+                    metric_count = unlabeled_count
+                else:
+                    metric_count = batch_size
+                if metric_count == 0:
+                    continue
                 sums[metric_name] = (
-                    sums.get(metric_name, 0.0) + float(value) * batch_size
+                    sums.get(metric_name, 0.0) + float(value) * metric_count
                 )
-            sample_count += batch_size
-
-            has_parameters = batch["has_params"].reshape(-1).bool()
-            labeled_count = int(has_parameters.sum())
+                metric_counts[metric_name] = (
+                    metric_counts.get(metric_name, 0) + metric_count
+                )
             if labeled_count:
                 height, width = batch["moving_group"].shape[-2:]
                 affine_metrics = affine_error_metrics(
@@ -811,7 +743,7 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
                 group_sums[group_id] += float(value) * count
                 group_counts[group_id] += count
 
-    metrics = {name: value / max(sample_count, 1) for name, value in sums.items()}
+    metrics = {name: value / metric_counts[name] for name, value in sums.items()}
     if affine_metric_count:
         metrics.update(
             {
@@ -876,6 +808,27 @@ def load_initial_weights(
         )
 
     saved_teacher_presence = bool(checkpoint.get("use_teacher_branch", False))
+    saved_teacher_input_version = (checkpoint.get("model_config") or {}).get(
+        "teacher_fixed_input_version"
+    )
+    if saved_teacher_presence and saved_teacher_input_version is None:
+        warnings.warn(
+            "This checkpoint predates the Mineral-aware teacher input contract. "
+            "Its state dict is compatible, but an unfrozen teacher warmup is "
+            "recommended before --freeze_teacher, especially for raw/hybrid "
+            "frontends.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif (
+        saved_teacher_presence
+        and saved_teacher_input_version != TEACHER_FIXED_INPUT_VERSION
+    ):
+        raise ValueError(
+            "Teacher fixed-input contract differs between the resume checkpoint "
+            f"and this code: {saved_teacher_input_version!r} vs "
+            f"{TEACHER_FIXED_INPUT_VERSION!r}"
+        )
     if (
         expected_use_teacher_branch is not None
         and saved_teacher_presence != expected_use_teacher_branch
@@ -996,17 +949,14 @@ def validate_args(a):
     if a.teacher_warmup_epochs < 0:
         raise ValueError("teacher_warmup_epochs cannot be negative")
     if a.teacher_warmup_epochs:
+        # Warmup accepts all-real, mixed, and all-synthetic loaders. Per-sample
+        # label integrity is enforced by parameter_supervision_mask at runtime.
         if not a.use_teacher_branch:
             raise ValueError("teacher_warmup_epochs requires --use_teacher_branch")
         if a.freeze_teacher:
             raise ValueError(
                 "--freeze_teacher conflicts with teacher-only warmup; set "
                 "--teacher_warmup_epochs 0 for frozen-teacher Stage 2"
-            )
-        if a.param_weight <= 0.0 or a.synthetic_prob < 1.0:
-            raise ValueError(
-                "Teacher-only warmup requires --param_weight > 0 and "
-                "--synthetic_prob 1.0 so every batch trains the teacher"
             )
     if a.freeze_teacher:
         if not a.use_teacher_branch:
@@ -1019,11 +969,13 @@ def validate_args(a):
         a.use_teacher_branch
         and (a.detach_teacher or a.freeze_teacher)
         and (a.synthetic_prob == 0.0 or a.param_weight == 0.0)
+        and a.teacher_warmup_epochs == 0
         and not a.resume_checkpoint
     ):
         raise ValueError(
-            "A detached teacher with no synthetic parameter supervision must "
-            "resume a full checkpoint containing a trained teacher"
+            "A detached teacher with neither parameter supervision nor an "
+            "image-supervised warmup must resume a full checkpoint containing "
+            "a trained teacher"
         )
     loss_weights = (
         a.param_weight,
@@ -1109,6 +1061,8 @@ def save_checkpoint_pair(
             "use_teacher_branch": model.teacher is not None,
         }
     )
+    if teacher_state is not None:
+        full_model_config["teacher_fixed_input_version"] = TEACHER_FIXED_INPUT_VERSION
     full_payload.update(
         {
             "checkpoint_type": "full_training",
@@ -1183,6 +1137,10 @@ def compute_training_loss(a, model, batch, epoch):
             moving_group=batch["moving_group"],
             group=batch["group_id"],
         )
+
+    components = {}
+    total = None
+    if not teacher_only:
         student_warped = warp_group_for_supervision(
             batch["moving_group"],
             batch["target_group"],
@@ -1209,11 +1167,16 @@ def compute_training_loss(a, model, batch, epoch):
             has_params=batch["has_params"],
             valid_overlap=student_overlap,
         )
-    components = {
-        f"student_{name}": value for name, value in student_components.items()
-    }
-    total = None if teacher_only else student_total
-    has_parameters = batch["has_params"].reshape(-1).bool()
+        components.update(
+            {f"student_{name}": value for name, value in student_components.items()}
+        )
+        total = student_total
+
+    has_parameters = parameter_supervision_mask(
+        student_params,
+        batch["params_true"],
+        batch["has_params"],
+    )
     if has_parameters.any():
         height, width = batch["moving_group"].shape[-2:]
         student_affine_metrics = affine_error_metrics(
@@ -1229,17 +1192,49 @@ def compute_training_loss(a, model, batch, epoch):
     if a.use_teacher_branch:
         teacher_has_supervision = bool(a.param_weight and has_parameters.any())
         teacher_without_graph = a.freeze_teacher or (
-            a.detach_teacher and not teacher_has_supervision
+            not teacher_only and a.detach_teacher and not teacher_has_supervision
         )
         teacher_context = torch.no_grad() if teacher_without_graph else nullcontext()
         with teacher_context:
             teacher_params = model.forward_teacher(
+                fixed_mineral=batch["fixed_mineral"],
                 target_group=batch["target_group"],
                 moving_group=batch["moving_group"],
                 group=batch["group_id"],
             )
 
-        if teacher_has_supervision:
+        if teacher_only:
+            teacher_warped = warp_group_for_supervision(
+                batch["moving_group"],
+                batch["target_group"],
+                teacher_params,
+                batch["params_true"],
+                batch["has_params"],
+            )
+            teacher_overlap = build_group_valid_overlap(
+                batch["moving_group"],
+                batch["target_group"],
+                batch["valid_group"],
+                teacher_params,
+                params_true=batch["params_true"],
+                has_params=batch["has_params"],
+            )
+            teacher_total, teacher_components = grouped_loss(
+                a,
+                params=teacher_params,
+                warped_group=teacher_warped,
+                target_group=batch["target_group"],
+                valid_group=batch["valid_group"],
+                group_id=batch["group_id"],
+                params_true=batch["params_true"],
+                has_params=batch["has_params"],
+                valid_overlap=teacher_overlap,
+            )
+            components.update(
+                {f"teacher_{name}": value for name, value in teacher_components.items()}
+            )
+            total = teacher_total
+        elif teacher_has_supervision:
             teacher_param = affine_control_point_loss(
                 teacher_params[has_parameters], batch["params_true"][has_parameters]
             )
@@ -1276,57 +1271,11 @@ def compute_training_loss(a, model, batch, epoch):
 
     if total is None or not total.requires_grad:
         raise RuntimeError(
-            "This training phase has no differentiable objective. Teacher-only "
-            "warmup requires synthetic parameter supervision; student training "
-            "requires at least one active student loss."
+            "This training phase has no differentiable objective. Configure at "
+            "least one applicable image, parameter, or regularization loss."
         )
     components["total"] = total
     return total, components, student_params
-
-
-def _hsv_to_rgb(image):
-    """Convert a normalized H/S/V image to RGB for a readable PNG overlay."""
-    hue = (image[..., 0] % 1.0) * 6.0
-    saturation = np.clip(image[..., 1], 0.0, 1.0)
-    value = np.clip(image[..., 2], 0.0, 1.0)
-    sector = np.floor(hue).astype(np.int64) % 6
-    fraction = hue - np.floor(hue)
-    p = value * (1.0 - saturation)
-    q = value * (1.0 - fraction * saturation)
-    t = value * (1.0 - (1.0 - fraction) * saturation)
-    candidates = (
-        np.stack((value, t, p), axis=-1),
-        np.stack((q, value, p), axis=-1),
-        np.stack((p, value, t), axis=-1),
-        np.stack((p, q, value), axis=-1),
-        np.stack((t, p, value), axis=-1),
-        np.stack((value, p, q), axis=-1),
-    )
-    rgb = np.zeros_like(image)
-    for index, candidate in enumerate(candidates):
-        rgb[sector == index] = candidate[sector == index]
-    return rgb
-
-
-def _to_display_rgb(image, group_id, sfo_mode):
-    image = image.detach().float().clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy()
-    if group_id == 5 and sfo_mode == "hsv":
-        image = _hsv_to_rgb(image)
-    return np.clip(image, 0.0, 1.0)
-
-
-def _save_group_overlay(
-    path, fixed_mineral, warped_group, valid_group, group_id, sfo_mode
-):
-    components = [_to_display_rgb(fixed_mineral, 1, "rgb")]
-    for slot, is_valid in enumerate(valid_group.tolist()):
-        if is_valid:
-            components.append(_to_display_rgb(warped_group[slot], group_id, sfo_mode))
-    # Screen compositing keeps every positive fluorescence signal visible.
-    stacked = np.stack(components, axis=0)
-    overlay = 1.0 - np.prod(1.0 - stacked, axis=0)
-    pixels = np.rint(np.clip(overlay, 0.0, 1.0) * 255.0).astype(np.uint8)
-    Image.fromarray(pixels, mode="RGB").save(path)
 
 
 def save_validation_overlays(
@@ -1359,18 +1308,13 @@ def save_validation_overlays(
             }
             if a.use_teacher_branch:
                 predictions["teacher"] = model.forward_teacher(
+                    fixed_mineral=batch["fixed_mineral"],
                     target_group=batch["target_group"],
                     moving_group=batch["moving_group"],
                     group=batch["group_id"],
                 )
             warped_predictions = {
-                name: warp_group_for_supervision(
-                    batch["moving_group"],
-                    batch["target_group"],
-                    params,
-                    batch["params_true"],
-                    batch["has_params"],
-                )
+                name: warp_model_space_group(batch["moving_group"], params)
                 for name, params in predictions.items()
             }
 
@@ -1560,13 +1504,19 @@ def main(a):
 
             batch_size = student_params.shape[0]
             labeled_count = int(batch["has_params"].reshape(-1).bool().sum())
+            unlabeled_count = batch_size - labeled_count
             for name, value in losses.items():
                 metric_name = f"train_{name}"
-                metric_count = (
-                    labeled_count
-                    if name in AFFINE_ERROR_COMPONENT_NAMES
-                    else batch_size
-                )
+                if (
+                    name in AFFINE_ERROR_COMPONENT_NAMES
+                    or name.endswith("_param")
+                    or (name == "teacher_total" and training_phase == "student")
+                ):
+                    metric_count = labeled_count
+                elif name.endswith("_reg"):
+                    metric_count = unlabeled_count
+                else:
+                    metric_count = batch_size
                 if metric_count == 0:
                     continue
                 sums[metric_name] = (

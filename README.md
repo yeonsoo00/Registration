@@ -10,16 +10,26 @@ an acquisition group from registered Mineral, the unregistered moving stains,
 and the group ID:
 
 ```python
-student_params = model(fixed_mineral, moving_group, group_id)
+student_params = model(
+    fixed_mineral=fixed_mineral,
+    moving_group=moving_group,
+    group=group_id,
+)
 ```
 
 It never receives a registered target stain. Normal inference therefore needs
 only registered Mineral and unregistered moving stains.
 
-During training, an independent teacher solves the easier same-stain problem:
+During training, an independent teacher uses both the cross-stain Mineral
+anchor and the easier registered same-stain target:
 
 ```python
-teacher_params = model.forward_teacher(target_group, moving_group, group_id)
+teacher_params = model.forward_teacher(
+    fixed_mineral=fixed_mineral,
+    target_group=target_group,
+    moving_group=moving_group,
+    group=group_id,
+)
 ```
 
 `target_group` contains the registered versions of the same stains as
@@ -46,9 +56,9 @@ The dataset retains the deployable eight-field contract:
 
 | Key | Shape | Use |
 | --- | --- | --- |
-| `fixed_mineral` | `C x H x W` | student fixed input |
+| `fixed_mineral` | `C x H x W` | student fixed input and teacher fixed evidence |
 | `moving_group` | `K x C x H x W` | student/teacher moving input; `K=3` padded slots |
-| `target_group` | `K x C x H x W` | training supervision and teacher fixed input only |
+| `target_group` | `K x C x H x W` | training supervision and teacher registered-group fixed evidence |
 | `valid_group` | `K` | valid stain slots |
 | `group_id` | scalar | G1-G5 routing ID |
 | `stain_indices` | `K` | signal numbers; padded slots are zero |
@@ -69,17 +79,20 @@ unregistered group -> configured group representation ---> shared CNN/FPN --+-> 
                                                                         -> student_params
 
 Training-only teacher
-registered target group -> configured group representation -> shared CNN/FPN --+
-unregistered group      -> configured group representation -> shared CNN/FPN --+-> local cost volumes
-                                                                            -> affine head
-                                                                            -> teacher_params
+registered Mineral      -> configured Mineral representation --+
+registered target group -> configured group representation ----+-> evidence-aware fixed fusion -> shared CNN/FPN --+
+unregistered group      -> configured group representation -------------------------------> shared CNN/FPN --+-> local cost volumes
+                                                                                                                 -> affine head
+                                                                                                                 -> teacher_params
 ```
 
 “Shared CNN/FPN” means weight sharing between the fixed and moving sides within
 one branch. Student and teacher branches themselves have independent weights.
-The teacher compares registered and unregistered representations of the same
-stain group, avoiding the student's more difficult Mineral-to-stain appearance
-and anatomy gap.
+The teacher compares the moving group with a validity-aware mean of registered
+target-group and Mineral representations. Where both fixed sources are valid
+they are averaged; where only one is valid it is preserved. This keeps the easier
+same-stain cue while exposing the teacher to the Mineral anchor used by the
+deployable student.
 
 ### Frontend modes
 
@@ -103,9 +116,10 @@ Raw and hybrid inputs pass through learnable Mineral-side and group-side input
 adapters before the shared CNN/FPN. The adapters project different input
 channel counts to the configured feature width. On the student path, the
 Mineral adapter processes `fixed_mineral` and the group adapter processes
-`moving_group`. On the teacher path, the same group adapter processes both
-`target_group` and `moving_group`, preserving the easier same-stain comparison.
-Structural mode does not insert these projection adapters.
+`moving_group`. On the teacher path, the Mineral adapter processes
+`fixed_mineral`; the group adapter processes `target_group` and `moving_group`. The fixed Mineral and target
+representations are then fused with the same validity-aware mean in structural,
+raw, and hybrid modes. Structural mode does not insert projection adapters.
 
 `--group_input_mode` controls the raw part of raw/hybrid group inputs:
 
@@ -177,6 +191,7 @@ across groups. Group 1 and evidence-free pairs still return exact identity.
 The code/checkpoint identifiers are:
 
 - architecture: `correlation_volume_teacher_student_affine_v1`
+- teacher fixed input: `mineral_target_validity_mean_v1`
 - structural descriptor: `torch_structural_no_enhancement_v3`
 - input contract: `fixed_mineral_moving_group_raw_v1`
 - training wrapper: `TeacherStudentAffineRegistrationModel`
@@ -188,7 +203,11 @@ Outside teacher-only warmup, the student supplies the image-registration
 prediction:
 
 ```python
-student_params = model(fixed_mineral, moving_group, group_id)
+student_params = model(
+    fixed_mineral=fixed_mineral,
+    moving_group=moving_group,
+    group=group_id,
+)
 # Real Stage 2 path; synthetic Stage 1 uses the composed one-pass path below.
 corrected_group = warp_group(real_moving_group, student_params)
 image_loss = image_objective(corrected_group, target_group, valid_group)
@@ -199,17 +218,28 @@ signal-support masks remove padded slots and newly exposed affine borders. The
 image objective can combine multiscale local NCC, gradient NCC, Charbonnier
 distance, multiscale gradient loss, and soft foreground Dice.
 
-When synthetic affine labels are available (`has_params=True`), the student
-and enabled teacher each receive a control-point affine loss against
-`params_true`. Distillation also uses control-point affine error:
+`params_true` exists only for synthetic rows (`has_params=True`). Real rows
+store an explicit NaN sentinel with `has_params=False`; they are never assigned
+an identity target. A shared runtime mask validates that every labeled row has
+a finite target and selects only those rows for control-point supervision.
+Outside warmup, distillation also uses control-point affine error:
 
 ```text
-L = L_student_image
-  + param_weight * I(has_params) * CP(student_params, params_true)
-  + param_weight * I(has_params) * CP(teacher_params, params_true)
+L_normal = L_student_image(all rows)
+  + param_weight * CP(student_params[has_params], params_true[has_params])
+  + optional param_weight * CP(teacher_params[has_params], params_true[has_params])
   + active_distill_weight * CP(student_params, teacher_params)
-  + optional Stage-2 student regularization
+  + reg_weight * R(student_params[~has_params])
+
+L_teacher_warmup = L_teacher_image(all rows)
+  + param_weight * CP(teacher_params[has_params], params_true[has_params])
+  + reg_weight * R(teacher_params[~has_params])
 ```
+
+`L_teacher_image` uses the same NCC, edge, Charbonnier, gradient, overlap, and
+valid-FOV machinery as the student image objective. Empty labeled or unlabeled
+subsets are skipped, so `synthetic_prob` may be anywhere in `[0, 1]` and
+`param_weight` may be zero.
 
 `CP` applies both affine transforms to the four normalized image corners and
 the center, then uses Smooth L1 error. This compares spatial displacement
@@ -232,9 +262,11 @@ The matrix order follows PyTorch `affine_grid`/`grid_sample`, whose affine maps
 output coordinates to input coordinates. Thus `corrected_full` is the one-pass
 equivalent of `corrected_sequential`, but samples from the pre-augmentation
 registered tensor and avoids compounded interpolation and clipping. Synthetic
-image losses, validation, and saved overlays use `corrected_full`; the
-sequential result remains useful only as a diagnostic. Here the source is the
-original normalized **model-space** tensor: it remains HSV for an HSV-configured
+image losses and quantitative validation use `corrected_full`. Saved validation
+overlays intentionally use the deployable sequential path
+`warp_model_space_group(synthetic_moving, A_pred)`, so they reproduce standalone
+inference instead of displaying the supervision-only full-source shortcut. The
+full-source supervision tensor is the original normalized **model-space** tensor: it remains HSV for an HSV-configured
 stain rather than being converted to display RGB before warping.
 
 Real Stage 2 has no known synthetic affine or pre-augmentation registered
@@ -260,15 +292,16 @@ The teacher controls are:
   consistency term.
 - `--detach_teacher` stops the distillation gradient at `teacher_params`, so
   distillation updates only the student. `--no-detach_teacher` lets that term
-  update both branches. Detaching does not disable the teacher's synthetic
-  `params_true` loss.
+  update both branches. Detaching does not disable the teacher loss during
+  teacher-only warmup or its synthetic `params_true` loss.
 - `--teacher_warmup_epochs N` makes epochs satisfying `epoch <= N` genuinely
   teacher-only. The student is put in evaluation mode, its parameters and
   running state are frozen, student image/parameter losses are not optimized,
-  and distillation is disabled. Only synthetic teacher control-point
-  supervision against `params_true` is optimized. At `epoch > N`, the student
-  is unfrozen and training switches to the normal student/image/distillation
-  objective. `0` starts normal student training in epoch 1.
+  and distillation is disabled. The teacher image objective uses every real and
+  synthetic row. Only synthetic rows add `params_true` supervision, while only
+  real rows add affine regularization. At `epoch > N`, the student is unfrozen
+  and training switches to the normal student/image/distillation objective. `0`
+  starts normal student training in epoch 1.
 - `--freeze_teacher` is intended for real Stage 2 after resuming a **full**
   Stage-1 teacher/student checkpoint. It sets every teacher parameter to
   `requires_grad=False`, keeps the teacher in evaluation mode throughout
@@ -283,12 +316,15 @@ training begins, the best tracker resets and thereafter selects by the student
 criterion, so a teacher-warmup score cannot prevent a later student checkpoint
 from becoming best.
 
-For real Stage 2, `has_params=False`. Use `--freeze_teacher` so the restored
-teacher serves as a fixed same-group expert while the student learns from image
-loss and detached distillation. A frozen Stage-2 teacher therefore requires the
-full Stage-1 checkpoint containing its trained weights; a deployable
-`*_student.pt` checkpoint is insufficient, and a random frozen teacher is not
-meaningful.
+For real Stage 2, `has_params=False` and `params_true` is undefined. There are
+two supported continuations: use a nonzero teacher warmup to adapt the restored
+teacher with real image losses, or use `--freeze_teacher` with
+`--teacher_warmup_epochs 0` to retain it as a fixed same-group expert. Both
+continuations should load the full Stage-1 checkpoint; a deployable
+`*_student.pt` artifact does not contain the teacher. When resuming a checkpoint
+created before the Mineral-aware teacher path, its state dict remains compatible,
+but run an unfrozen teacher warmup before `--freeze_teacher`, especially in raw
+or hybrid mode, so the teacher Mineral adapter learns this new role.
 
 ## Checkpoints and final validation overlays
 
@@ -296,8 +332,11 @@ For each requested checkpoint name, training writes two artifacts:
 
 - `<stem>.pt`: full student, teacher, optimizer, scheduler, and training state;
   use this for Stage 2 resume.
-- `<stem>_student.pt`: deployable student configuration and weights only; use
-  this with `inference.py`.
+- `<stem>_student.pt`: deployable student configuration and weights only.
+
+`inference.py` accepts either artifact and extracts only the student fields. Use
+the full `<stem>.pt` when checking literal same-checkpoint parity with final
+validation, or the smaller `<stem>_student.pt` for ordinary deployment.
 
 For example, `stage2_best_model.pt` produces the deployable
 `stage2_best_model_student.pt`. `inference.py` constructs only
@@ -306,17 +345,18 @@ teacher branch. Both artifacts store the canonical `student_model_config`,
 including `frontend_mode`, `group_input_mode`, and the padded group-slot count.
 The config also includes `affine_head_mode`; inference reconstructs that head
 before strict-loading weights. Checkpoints created before this option are
-interpreted as `affine_head_mode=joint`.
+interpreted as `affine_head_mode=joint`. Full training checkpoints additionally
+record `teacher_fixed_input_version=mineral_target_validity_mean_v1`; this
+teacher-only field is deliberately omitted from the deployable student artifact.
 
 The full checkpoint also records literal frontend/group/head keys in its wrapper
 `model_config`; the student-only artifact contains a flat deployable
 `model_config` copy.
 
 Inference has no frontend or affine-head override. It reconstructs the exact
-frontend, affine head, and learnable adapter shapes from the student
-checkpoint, then strict-loads the student weights. Older TeacherStudent
-structural checkpoints that predate these
-keys are interpreted as `frontend_mode=structural`,
+frontend, affine head, and learnable adapter shapes from the selected full or
+student-only checkpoint, then strict-loads only the student weights. Older
+TeacherStudent structural checkpoints that predate these keys are interpreted as `frontend_mode=structural`,
 `group_input_mode=overlay`, and three group slots.
 
 After all epochs finish, training reloads the best full checkpoint and saves
@@ -327,12 +367,14 @@ validation predictions under:
 <output_dir>/validation_overlays/teacher/
 ```
 
-Each overlay combines registered Mineral with every valid stain warped with
-one group-wide affine for that branch. Teacher overlays are diagnostic only
-because they use `target_group` to make the teacher prediction. These final
-overlays use the fixed sample-level validation split. Synthetic validation
-overlays use the composed one-pass `warp(target_group, A_syn @ A_pred)` result;
-real-data overlays use `warp(real_moving_group, A_pred)`. Files use the stable
+Each overlay combines registered Mineral with every valid observed moving stain
+warped by one group-wide affine for that branch. Teacher overlays are diagnostic
+only because both `fixed_mineral` and training-only `target_group` are used to
+predict the teacher affine. Both
+synthetic and real overlays then call the exact two-argument deployment helper:
+`warp_model_space_group(moving_group, predicted_params)`. Registered targets,
+`params_true`, and `has_params` do not enter visualization warping. These final
+overlays use the fixed sample-level validation split. Files use the stable
 name `{ordinal}_{sample}_G{id}.png` in both branch folders for side-by-side
 review.
 
@@ -347,16 +389,16 @@ teacher/student checkpoint such as `best_model.pt`; a deployable
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/debug_teacher.py \
-  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_teacher_student_raw_overlay/best_model.pt \
-  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20/best_model.pt \
+  --registered_root /home/yec23006/projects/research/Registration/Data/Testdata/Val \
   --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Debug/teacher_audit \
   --max_items 8 --synthetic_seed 9090 --device cuda --gpu_ids 0
 ```
 
 The audit deliberately passes an empty unregistered-data path. Its moving
 source is a deterministic inverse-matrix warp of the registered target group,
-not a real unregistered image; the teacher fixed source is the registered
-`target_group` structural union, not Mineral. For every selected item it prints
+not a real unregistered image; the teacher fixed source is the evidence-aware
+fusion of registered `target_group` and registered Mineral representations. For every selected item it prints
 and saves the unwarped moving source plus the true, inverse-matrix,
 teacher-predicted, and student-predicted warps. It reports every image target
 MAE and the teacher and student control-point errors against `params_true`.
@@ -381,12 +423,12 @@ individual source/warp images, `metrics.csv`, and `audit.txt`.
 ## Stage 1: synthetic teacher/student training
 
 Stage 1 creates `moving_group` by applying a random inverse affine to the
-registered `target_group`; registered Mineral remains fixed and
-`params_true` is known. Prediction still consumes the synthetic moving tensor,
+registered `target_group`; registered Mineral remains fixed and is supplied to
+both teacher and student, while `params_true` is known. Prediction still consumes the synthetic moving tensor,
 but image supervision and output rendering compose the synthetic and predicted
 affines and sample the registered model-space source once. With a nonzero
-`teacher_warmup_epochs`, the first `N` epochs optimize only the teacher's
-synthetic control-point loss; student optimization and its learning-rate
+`teacher_warmup_epochs`, the first `N` epochs optimize the teacher image loss
+and its synthetic control-point loss; student optimization and its learning-rate
 schedule begin in epoch `N+1`. Start this architecture from scratch:
 
 ```bash
@@ -453,7 +495,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --model_scale_range 0.8 1.2 --translation_limit 0.5 \
   --max_rotation_deg 20 \
   --synthetic_prob 1.0 --val_synthetic_prob 1.0 \
-  --tx_range -64 64 --ty_range -64 64 \
+  --tx_range -64 64 --ty_range -64 100 \
   --rot_range -15 15 --scale_range 0.85 1.15 \
   --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
   --charbonnier_weight 0.1 --gradient_weight 0.1 \
@@ -500,7 +542,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --best_checkpoint_name best_model.pt \
   --last_checkpoint_name last_model.pt \
   --use_teacher_branch \
-  --frontend_mode raw --group_input_mode overlay \
+  --frontend_mode structural --group_input_mode overlay \
   --affine_head_mode separated \
   --teacher_distill_weight 1.0 \
   --detach_teacher \
@@ -534,8 +576,9 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
 
 ### 2. Teacher raw representation
 
-This run gives the teacher registered and moving raw group stacks and gives the
-student raw Mineral versus the raw moving group stack.
+This run gives the teacher registered Mineral, the registered raw target-group
+representation, and the moving raw group representation. The student still sees
+only raw Mineral versus the raw moving group.
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
@@ -564,7 +607,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --model_scale_range 0.8 1.2 --translation_limit 0.5 \
   --max_rotation_deg 20 \
   --synthetic_prob 1.0 --val_synthetic_prob 1.0 \
-  --tx_range -64 64 --ty_range -64 64 \
+  --tx_range -64 64 --ty_range -64 100 \
   --rot_range -15 15 --scale_range 0.85 1.15 \
   --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
   --charbonnier_weight 0.1 --gradient_weight 0.1 \
@@ -579,7 +622,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
   --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
   --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_bigger \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20_mineral \
   --best_checkpoint_name best_model.pt \
   --last_checkpoint_name last_model.pt \
   --use_teacher_branch \
@@ -597,29 +640,54 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --crop_mode full --crop_margin 32 \
   --encoder_base_channels 24 --encoder_depth 5 --feature_width 48 \
   --cost_hidden_channels 48 --cost_volume_radii 8 6 4 \
-  --cost_pool_size 4 --correlation_temperature 0.07 \
+  --cost_pool_size 2 --correlation_temperature 0.07 \
   --latent_dim 384 --group_embedding_dim 32 --norm_type group \
   --model_scale_range 0.8 1.2 --translation_limit 0.5 \
-  --max_rotation_deg 20 \
+  --max_rotation_deg 30 \
   --synthetic_prob 1.0 --val_synthetic_prob 1.0 \
-  --tx_range -100 100 --ty_range -100 100 \
-  --rot_range -20 20 --scale_range 0.85 1.15 \
-  --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
-  --charbonnier_weight 0.1 --gradient_weight 0.1 \
+  --tx_range -64 64 --ty_range -100 100 \
+  --rot_range -30 30 --scale_range 0.80 1.20 \
+  --param_weight 20.0 --ncc_weight 1.0 --edge_weight 0.50 \
+  --charbonnier_weight 0.01 --gradient_weight 0.1 \
   --overlap_weight 0.5 --reg_weight 0.0 \
   --epochs 1000 --batch_size 4 --lr 0.0003 \
   --weight_decay 0.00001 --grad_clip 1.0 \
   --val_split 0.15 --split_seed 2026 \
   --n_workers 8 --amp --gpu_ids 0,1 \
   --wandb_project registration \
-  --wandb_run_name correlation_volume_teacher_frontend_raw_stage1_separate_1024_bigger
+  --wandb_run_name correlation_volume_teacher_frontend_raw_stage1_separate_1024_mineral
+
+
+  python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
+  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TefacherStudent/ckpt/raw_separate_1024_bigger_edge\
+   --best_checkpoint_name best_model.pt --last_checkpoint_name last_model.pt \
+   --use_teacher_branch --frontend_mode raw --group_input_mode overlay --affine_head_mode separated \
+   --teacher_distill_weight 1.0 --detach_teacher \
+   --teacher_warmup_epochs 300 --no-include_group1 --force_group1_identity --structural_distance_scale 0.03 --structural_context_scale 0.03 \
+   --structural_skeleton_radius 4 \
+   --separate_group_heads --separate_group_adapters --use_group_embedding \
+   --height 1024 --width 1024 --image_mode rgb --sfo_mode hsv --crop_mode full \
+   --crop_margin 32 --encoder_base_channels 24 --encoder_depth 5 --feature_width 48 \
+   --cost_hidden_channels 48 --cost_volume_radii 8 6 4 --cost_pool_size 4 \
+   --correlation_temperature 0.07 --latent_dim 384 --group_embedding_dim 32 --norm_type group \
+   --model_scale_range 0.8 1.2 --translation_limit 0.5 --max_rotation_deg 30 \
+   --synthetic_prob 1.0 --val_synthetic_prob 1.0 \
+   --tx_range -64 64 --ty_range -100 100 --rot_range -30 30 --scale_range 0.80 1.20 \
+   --param_weight 5.0 --ncc_weight 1.0 --edge_weight 1.0 --charbonnier_weight 0.1 --gradient_weight 0.1 --overlap_weight 0.5 \
+   --reg_weight 0.0 --epochs 1000 --batch_size 4 --lr 0.0003 \
+   --weight_decay 0.00001 --grad_clip 1.0 --val_split 0.15 \
+   --split_seed 2026 --n_workers 8 --amp --gpu_ids 0,1 \
+   --wandb_project registration --wandb_run_name raw_stage1_separate_1024_bigger_edge
 ```
 
 
 ### 3. Teacher hybrid representation
 
-This run concatenates the corresponding raw stack and structural union before
-each learnable group input adapter.
+This run concatenates raw inputs with their structural descriptors before each
+learnable adapter. The teacher fuses its adapted Mineral and registered-target
+fixed representations before matching them against the moving group.
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
@@ -731,34 +799,38 @@ corresponding teacher metrics/overlays. For Stage 2, resume the full
 validation rejects accidental head changes. Inference has no head override and
 rebuilds the correct deployable student from its `_student.pt` checkpoint.
 
-## Stage 2: real unregistered fine-tuning
+## Stage 2: real-data teacher adaptation and fine-tuning
 
-Stage 2 uses real unregistered stains as `moving_group`, their registered
-counterparts as `target_group`, and sets `has_params=False`. Resume the full
-Stage-1 checkpoint—not `best_model_student.pt`—so the trained teacher is
-restored, and pass `--freeze_teacher` to make it a fixed, evaluation-mode
-distillation expert. Frozen-teacher predictions are detached regardless of the
-detach-teacher CLI setting. Architecture, frontend mode, group input mode,
-affine head mode, descriptor, and preprocessing arguments must match Stage 1
-exactly. In particular, every Stage-2 run must retain `--affine_head_mode`; a
-raw or hybrid Stage-1 run must also retain its `--frontend_mode` and
-`--group_input_mode`. Stage 2 directly warps each real moving group with
-`A_pred`; the synthetic one-pass composition is not used.
+Stage 2 may mix real unregistered rows with synthetic rows. Each training item
+is synthetic with probability `synthetic_prob`; otherwise it uses the real
+unregistered stain as `moving_group`, its registered counterpart as
+`target_group`, `has_params=False`, and an undefined `params_true`. During a
+nonzero teacher warmup, both kinds contribute image losses, only synthetic rows
+contribute control-point supervision, and only real rows contribute affine
+regularization. Validation can remain fully real with
+`--val_synthetic_prob 0.0`.
+
+Resume the full Stage-1 checkpoint, not `best_model_student.pt`, so the trained
+teacher is restored. Architecture, frontend mode, group input mode, affine head
+mode, descriptor, and preprocessing arguments must match Stage 1 exactly. Real
+rows directly warp the observed moving group with `A_pred`; only synthetic rows
+use the one-pass composed source. This example runs 50 teacher-only adaptation
+epochs on mixed real/synthetic data, then releases the student:
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
   --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
   --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024/stage2_teacher_student \
-  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024/best_model.pt \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20 \
+  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20/best_model.pt \
   --best_checkpoint_name stage2_best_model.pt \
   --last_checkpoint_name stage2_last_model.pt \
   --use_teacher_branch \
   --frontend_mode raw --group_input_mode overlay \
   --affine_head_mode separated \
   --teacher_distill_weight 1.0 \
-  --freeze_teacher --detach_teacher \
-  --teacher_warmup_epochs 0 \
+  --detach_teacher \
+  --teacher_warmup_epochs 50 \
   --no-include_group1 --force_group1_identity \
   --structural_distance_scale 0.03 \
   --structural_context_scale 0.03 \
@@ -772,51 +844,129 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --latent_dim 384 --group_embedding_dim 32 --norm_type group \
   --model_scale_range 0.8 1.2 --translation_limit 0.5 \
   --max_rotation_deg 20 \
-  --synthetic_prob 0.0 --val_synthetic_prob 0.0 \
-  --tx_range -64 64 --ty_range -64 64 \
+  --synthetic_prob 0.5 --val_synthetic_prob 0.0 \
+  --tx_range -64 64 --ty_range -100 100 \
   --rot_range -15 15 --scale_range 0.85 1.15 \
-  --param_weight 0.0 --ncc_weight 1.0 --edge_weight 0.25 \
+  --param_weight 20.0 --ncc_weight 1.0 --edge_weight 0.25 \
   --charbonnier_weight 0.1 --gradient_weight 0.1 \
-  --overlap_weight 0.5 --reg_weight 0.01 \
-  --epochs 800 --batch_size 4 --lr 0.00001 \
+  --overlap_weight 1.0 --reg_weight 0.01 \
+  --epochs 400 --batch_size 4 --lr 0.00001 \
   --weight_decay 0.00001 --grad_clip 1.0 \
   --val_split 0.15 --split_seed 2026 \
   --n_workers 8 --amp --gpu_ids 0,1 \
   --wandb_project registration \
-  --wandb_run_name correlation_volume_teacher_student_stage2_real
+  --wandb_run_name correlation_volume_teacher_student_stage2_teacher_adaptation
+
+conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
+  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20 \
+  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20/best_model.pt \
+  --best_checkpoint_name stage2_best_model.pt \
+  --last_checkpoint_name stage2_last_model.pt \
+  --use_teacher_branch \
+  --frontend_mode raw --group_input_mode overlay \
+  --affine_head_mode separated \
+  --teacher_distill_weight 1.0 \
+  --detach_teacher \
+  --teacher_warmup_epochs 50 \
+  --no-include_group1 --force_group1_identity \
+  --structural_distance_scale 0.03 \
+  --structural_context_scale 0.03 \
+  --structural_skeleton_radius 4 \
+  --separate_group_heads --separate_group_adapters --use_group_embedding \
+  --height 1024 --width 1024 --image_mode rgb --sfo_mode hsv \
+  --crop_mode full --crop_margin 32 \
+  --encoder_base_channels 24 --encoder_depth 5 --feature_width 48 \
+  --cost_hidden_channels 48 --cost_volume_radii 6 5 4 \
+  --cost_pool_size 2 --correlation_temperature 0.07 \
+  --latent_dim 384 --group_embedding_dim 32 --norm_type group \
+  --model_scale_range 0.8 1.2 --translation_limit 0.5 \
+  --max_rotation_deg 20 \
+  --synthetic_prob 0.5 --val_synthetic_prob 0.0 \
+  --tx_range -64 64 --ty_range -100 100 \
+  --rot_range -15 15 --scale_range 0.85 1.15 \
+  --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
+  --charbonnier_weight 0.1 --gradient_weight 0.1 \
+  --overlap_weight 1.0 --reg_weight 0.01 \
+  --epochs 400 --batch_size 4 --lr 0.00001 \
+  --weight_decay 0.00001 --grad_clip 1.0 \
+  --val_split 0.15 --split_seed 2026 \
+  --n_workers 8 --amp --gpu_ids 0,1 \
+  --wandb_project registration \
+  --wandb_run_name correlation_volume_teacher_student_stage2_teacher_adaptation
 ```
+
+For all-real teacher adaptation, keep the nonzero warmup and use
+`--synthetic_prob 0.0` with `--param_weight 0.0`; the teacher then learns
+exclusively from NCC, edge, Charbonnier, gradient, overlap, and regularization
+losses. For the earlier fixed-teacher Stage-2 behavior, use
+`--teacher_warmup_epochs 0`, `--freeze_teacher`, `--synthetic_prob 0.0`, and
+`--param_weight 0.0`. `--freeze_teacher` and nonzero teacher warmup are
+intentionally mutually exclusive.
 
 ## Target-free student inference
 
-Use the derived student-only Stage-2 artifact. The registered root may contain
-only Mineral; registered group stains are not discovered or loaded. The
+Use either the full Stage-1/Stage-2 checkpoint or its derived student-only
+artifact. Both load the identical student state; the teacher is never
+constructed by inference. Each sample directory under
+`--unregistered_root` must contain fixed Mineral stain 1 together with the
+moving stains. Omit `--registered_root` entirely for target-free prediction. The
 deployment call remains exactly:
 
 ```python
-params = model(fixed_mineral, moving_group, group_id)
+params = model(
+    fixed_mineral=batch["fixed_mineral"],
+    moving_group=batch["moving_group"],
+    group=batch["group_id"],
+)
 ```
 
-Neither `target_group` nor a frontend CLI argument is required for prediction.
+Inference then calls the same
+`warp_model_space_group(moving_group, predicted_params)` function used by
+`save_validation_overlays()`. It always warps the observed moving tensor;
+`target_group`, `params_true`, and `has_params` cannot select another rendering
+path. Neither registered targets nor a frontend CLI argument is required for
+prediction. Inference always takes fixed Mineral stain 1 from
+`--unregistered_root`,
+so adding evaluation targets cannot change the student input or prediction.
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/inference.py \
-  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage2_teacher_student/stage2_best_model_student.pt \
-  --registered_root /home/yec23006/projects/research/Registration/Data/Testdata/Registered \
-  --unregistered_root /home/yec23006/projects/research/Registration/Data/Testdata/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Results/stage2_student \
+  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20/best_model_student.pt \
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered\
+  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Results/All/param20 \
   --include_group1 \
   --batch_size 4 --n_workers 4 --device cuda --gpu_ids 0,1
+
+  python inference.py \
+  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024/best_model_student.pt\
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Testdata/Unregistered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Results/stage1
 ```
 
-Outputs include aligned original RGB stains,
-`predicted_group_affine_parameters.csv`, group-only overlays, and
-`group_overlays/<sample>/groupN_with_mineral_overlay.png`.
+`model_space_group_overlays/<index>_<sample>_G<group>.png` is produced with the
+same `_save_group_overlay()` call as validation: the same normalized
+`fixed_mineral`, warped group, `valid_group`, `group_id`, and `sfo_mode` form an
+HSV-aware screen composite. It is therefore the direct validation-style output
+to compare. Real Stage-2 and synthetic Stage-1 validation are comparable
+to inference because all visualization paths warp their actual `moving_group` once with the
+predicted affine. The composed full-source warp remains limited to training and
+quantitative supervision.
+
+Inference also writes original-resolution aligned RGB stains,
+`predicted_group_affine_parameters.csv`, and the existing max composites:
+group-only `group_overlays/<sample>/groupN_overlay.png` and Mineral-plus-group
+`group_overlays/<sample>/groupN_with_mineral_overlay.png`. These are useful
+delivery outputs, but they are not the model-space validation composite.
 
 ## Optional registered-target evaluation
 
-Add `--eval_with_registered_targets` only when registered counterparts exist
-for all moving stains. The student prediction is unchanged: targets are used
-only after prediction to compute support-masked MAE/NCC.
+Supply `--registered_root` only when registered counterparts exist for all
+moving stains. Its presence automatically enables support-masked MAE/NCC; no
+additional evaluation flag is needed. Registered target tensors are never
+passed to the student and are used only after prediction to compute metrics.
 
 ```bash
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/inference.py \
@@ -824,12 +974,13 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --registered_root /home/yec23006/projects/research/Registration/Data/Testdata/Registered \
   --unregistered_root /home/yec23006/projects/research/Registration/Data/Testdata/Unregistered \
   --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Results/stage2_student_registered_target_eval \
-  --include_group1 --eval_with_registered_targets \
+  --include_group1 \
   --batch_size 4 --n_workers 4 --device cuda --gpu_ids 0,1
 ```
 
-This additionally writes `registered_target_metrics.csv` and prints the mean
-MAE and NCC. Registered targets remain absent from model prediction.
+This writes `registered_target_metrics.csv` and prints the mean MAE and NCC.
+The deprecated positive `--eval_with_registered_targets` alias is still accepted
+with a registered root, but it is redundant.
 
 ## Compatibility and smoke checks
 

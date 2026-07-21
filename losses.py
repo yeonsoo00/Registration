@@ -80,7 +80,8 @@ def ncc_loss(
     covariance = (w * mc * tc).sum(dim=-1)
     variance_m = (w * mc.square()).sum(dim=-1)
     variance_t = (w * tc.square()).sum(dim=-1)
-    correlation = covariance / (torch.sqrt(variance_m * variance_t) + eps)
+    variance_product = (variance_m * variance_t).clamp_min(0.0)
+    correlation = covariance / torch.sqrt(variance_product + eps * eps)
     correlation = correlation.clamp(-1.0, 1.0)
     return 1.0 - correlation.mean()
 
