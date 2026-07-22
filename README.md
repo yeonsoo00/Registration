@@ -94,6 +94,56 @@ they are averaged; where only one is valid it is preserved. This keeps the easie
 same-stain cue while exposing the teacher to the Mineral anchor used by the
 deployable student.
 
+
+### Encoder architectures and correlation projections
+
+`--encoder_arch {current,residual}` selects the bottom-up encoder used by the
+FPN in both branches:
+
+- `current` preserves the existing `ConvStage` encoder and is the default for
+  backward compatibility. If `--encoder_channels` is omitted, its stage widths
+  still come from the legacy `encoder_base_channels`/`encoder_depth` schedule.
+- `residual` uses the larger residual encoder. Its default stage widths are
+  `64 96 128 192 256`; override them with one positive integer per stage via
+  `--encoder_channels`. `--encoder_blocks_per_stage` accepts either one count
+  repeated for every stage or one count per stage and defaults to
+  `2 2 2 2 2` for the default residual channel schedule.
+
+`--encoder_channels` is valid in either mode, and its list length defines the
+stage count. `--encoder_blocks_per_stage` is residual-only.
+
+Each residual block is
+`3x3 Conv -> GroupNorm -> GELU -> 3x3 Conv -> GroupNorm -> residual add -> GELU`.
+The first block in every stage downsamples by two. A learned stride-aware `1x1`
+projection carries the skip when resolution or channel count changes; a
+same-shape block uses an identity skip. Convolutions use Kaiming initialization,
+and the second GroupNorm begins at zero so the learned residual branch
+initially contributes zero. Residual encoder and FPN normalization is always
+GroupNorm, independent of `--norm_type`, because effective registration batches
+can be small.
+
+The stage geometry is unchanged: stages 0 and 1 produce the 1/2 and 1/4
+bottom-up maps, and selected cost volumes still begin at stage index 2 (1/8).
+`cost_volume_radii` selects the same consecutive pyramid indices as before.
+Fixed and moving representations are concatenated and passed through one
+`shared_encoder` call, so the Siamese sides have exactly shared weights. The
+student and teacher receive identical encoder configurations but retain their
+existing independent branch weights.
+
+`--correlation_feature_width W` optionally gives every selected pyramid level
+a shared `1x1` projection to a common width before L2 normalization and local
+correlation. New runs default to `W=96`. One projection module is reused for
+the fixed and moving tensors at its level; when `W == feature_width`, it is an
+identity and adds no parameters. This does not change the FPN maps consumed by
+the existing cost-volume aggregators.
+
+This experiment does not add hierarchical/coarse-to-fine correlation, feature
+warping between levels, or a new coarse affine stage. Local cost volumes remain
+independent at the existing selected resolutions, and the configured affine
+head is unchanged. In particular, `separated_residual` retains only its
+previously documented cost-statistics proposal; this modification does not
+alter it.
+
 ### Frontend modes
 
 `--frontend_mode` selects the online representation built inside both the
@@ -153,6 +203,107 @@ C(x, d) = cosine(F_fixed(x), F_moving(x + d))
 The multiscale cost features feed the group-conditioned affine head. The
 five-parameter output is `(tx, ty, rotation, scale_x, scale_y)` and is converted
 to one `2 x 3` matrix for every valid stain slot.
+
+
+### Auxiliary cost-volume output and direct correspondence supervision
+
+Branch forwards accept `return_aux=False`. The default remains the legacy
+behavior and returns only the `B x 5` affine-parameter tensor. Training or a
+diagnostic can request `return_aux=True`:
+
+```python
+student_output = model(
+    fixed_mineral=fixed_mineral,
+    moving_group=moving_group,
+    group=group_id,
+    return_aux=True,
+)
+teacher_output = model.forward_teacher(
+    fixed_mineral=fixed_mineral,
+    target_group=target_group,
+    moving_group=moving_group,
+    group=group_id,
+    return_aux=True,
+)
+```
+
+Each output is `{"params": affine_params, "levels": [...]}`. Every selected
+level contains:
+
+| Field | Meaning |
+| --- | --- |
+| `volume` | raw pre-softmax cosine cost volume, `B x Kd x H x W` |
+| `probability` | validity-masked correspondence probability over `Kd` local displacements |
+| `expected_displacement` | ungated probability expectation `(dx, dy)` in feature pixels |
+| `confidence` | maximum candidate probability |
+| `certainty` | one minus normalized correspondence entropy |
+| `displacements` | candidate table in `(dx, dy)` order |
+| `fixed_valid`, `moving_valid` | evidence/FOV validity at this pyramid level |
+| `feature_size` | `[H, W]` for the level |
+
+An additional `candidate_valid` tensor records the exact per-displacement
+border/evidence support used by the local softmax. It lets the training loss
+normalize a target distribution without guessing validity from a probability
+that may underflow. Multi-GPU metadata is transported in a batched tensor form
+inside `DataParallel` and restored to the same public `Kd x 2` displacement
+table and `[H, W]` list by the wrapper.
+
+Synthetic `params_true` uses the existing PyTorch sampling convention. Let
+`A_true = affine_parameters_to_matrix(params_true)`. Because `affine_grid`
+maps output coordinates to input coordinates, `A_true` maps a fixed feature
+coordinate to the corresponding moving feature coordinate. For each level:
+
+```text
+q_fixed  = identity affine_grid coordinate
+q_moving = A_true(q_fixed)
+d_true   = (q_moving - q_fixed) * ((W - 1) / 2, (H - 1) / 2)
+```
+
+Thus `d_true` is a fixed-to-moving displacement in feature-map pixels, exactly
+matching `C(x,d) = cosine(F_fixed(x), F_moving(x+d))`. The target builder uses
+`A_true` directly, not its inverse, and uses `align_corners=True` just like the
+registration utilities.
+
+The geometric confidence mask requires a synthetic row (`has_params=True`), a
+valid fixed location, an in-image `q_moving`, and moving validity sampled at
+that coordinate. Displacement and distribution supervision further require
+both components of `d_true` to lie inside the square local search radius. The
+Gaussian distribution target is
+
+```text
+p_target(d_i) proportional to exp(-||d_i - d_true||^2 / (2 sigma^2))
+```
+
+and is normalized only over `candidate_valid` displacements. Empty masks and
+levels are skipped with finite graph-connected zeros rather than NaNs. Real
+rows keep their NaN `params_true` sentinel and never enter affine conversion or
+correspondence supervision.
+
+The three direct terms are:
+
+- Smooth L1 between predicted and true expected displacement;
+- soft cross-entropy between predicted probability and the Gaussian target;
+- binary cross-entropy on confidence. A geometrically valid in-radius match has
+  confidence target 1; a geometrically valid match outside the search radius
+  has target 0. Out-of-image correspondences are excluded rather than labeled
+  negative.
+
+For branch `b` (`student` or `teacher`), weighting is:
+
+```text
+L_corr_b = b_corr_weight * (
+    corr_displacement_weight * L_displacement
+  + corr_distribution_weight * L_distribution
+  + corr_confidence_weight   * L_confidence
+)
+```
+
+`--corr_target_sigma` is measured in feature pixels and defaults to `1.0`.
+`--student_corr_weight` and `--teacher_corr_weight` default to `1.0` and allow
+one branch to be ablated without changing the component weights. All three
+component weights default to zero, preserving old training. Synthetic samples
+supervise student and teacher independently; during teacher-only warmup only
+the teacher term updates, while the normal phase can apply both branch terms.
 
 ### Affine head modes
 
@@ -229,10 +380,12 @@ L_normal = L_student_image(all rows)
   + param_weight * CP(student_params[has_params], params_true[has_params])
   + optional param_weight * CP(teacher_params[has_params], params_true[has_params])
   + active_distill_weight * CP(student_params, teacher_params)
+  + L_corr_student + optional L_corr_teacher
   + reg_weight * R(student_params[~has_params])
 
 L_teacher_warmup = L_teacher_image(all rows)
   + param_weight * CP(teacher_params[has_params], params_true[has_params])
+  + L_corr_teacher
   + reg_weight * R(teacher_params[~has_params])
 ```
 
@@ -298,8 +451,8 @@ The teacher controls are:
   teacher-only. The student is put in evaluation mode, its parameters and
   running state are frozen, student image/parameter losses are not optimized,
   and distillation is disabled. The teacher image objective uses every real and
-  synthetic row. Only synthetic rows add `params_true` supervision, while only
-  real rows add affine regularization. At `epoch > N`, the student is unfrozen
+  synthetic row. Only synthetic rows add `params_true` and direct cost-volume supervision,
+  while only real rows add affine regularization. At `epoch > N`, the student is unfrozen
   and training switches to the normal student/image/distillation objective. `0`
   starts normal student training in epoch 1.
 - `--freeze_teacher` is intended for real Stage 2 after resuming a **full**
@@ -343,7 +496,9 @@ For example, `stage2_best_model.pt` produces the deployable
 `CorrelationVolumeAffineRegistrationModel`; it does not construct or load the
 teacher branch. Both artifacts store the canonical `student_model_config`,
 including `frontend_mode`, `group_input_mode`, and the padded group-slot count.
-The config also includes `affine_head_mode`; inference reconstructs that head
+The config also includes `affine_head_mode`, `encoder_arch`, the resolved
+`encoder_channels`, `encoder_blocks_per_stage`, `encoder_depth`, and
+`correlation_feature_width`; inference reconstructs those modules and that head
 before strict-loading weights. Checkpoints created before this option are
 interpreted as `affine_head_mode=joint`. Full training checkpoints additionally
 record `teacher_fixed_input_version=mineral_target_validity_mean_v1`; this
@@ -352,6 +507,32 @@ teacher-only field is deliberately omitted from the deployable student artifact.
 The full checkpoint also records literal frontend/group/head keys in its wrapper
 `model_config`; the student-only artifact contains a flat deployable
 `model_config` copy.
+
+
+Encoder checkpoint loading is explicit:
+
+- A checkpoint without the new encoder fields is canonicalized as
+  `encoder_arch=current`, with the legacy base/depth channel schedule,
+  `encoder_blocks_per_stage=None`, and
+  `correlation_feature_width=feature_width`. It therefore recreates the old
+  no-projection network and strict-loads normally.
+- On a same-architecture resume, omitted channel, block, and correlation-width
+  flags are inherited from the checkpoint. Other architecture/config
+  mismatches remain errors.
+- The one supported architecture migration is an explicitly requested
+  `current -> residual` resume. It uses `strict=False` only after verifying that
+  every changed config field is encoder-related. The loader prints every
+  shape-compatible loaded key, every newly initialized destination key, every
+  unexpected checkpoint key, and every shape mismatch for both student and
+  teacher. Residual convolutions that cannot be restored retain their defined
+  Kaiming/identity-aware initialization.
+- Residual-to-current migration and silent unrelated config changes are
+  rejected. Non-strict loading is never used without the detailed migration
+  report.
+
+The correlation-loss weights and sigma are optimization settings stored in the
+full checkpoint `train_config`; encoder structure belongs to
+`student_model_config` and is also present in the deployable student artifact.
 
 Inference has no frontend or affine-head override. It reconstructs the exact
 frontend, affine head, and learnable adapter shapes from the selected full or
@@ -516,6 +697,113 @@ The important outputs are:
 .../stage1_teacher_student/validation_overlays/student/
 .../stage1_teacher_student/validation_overlays/teacher/
 ```
+
+
+### Stage 1 residual encoder with direct correspondence supervision
+
+This complete run activates only the two additions in this experiment: the
+larger residual FPN and direct supervision of the existing local cost volumes.
+It uses the ordinary separated affine head, so no coarse affine proposal is
+introduced.
+
+```bash
+conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
+  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_residual_corr_raw \
+  --best_checkpoint_name best_model.pt \
+  --last_checkpoint_name last_model.pt \
+  --use_teacher_branch \
+  --frontend_mode raw --group_input_mode overlay \
+  --affine_head_mode separated \
+  --teacher_distill_weight 1.0 --detach_teacher \
+  --teacher_warmup_epochs 50 \
+  --no-include_group1 --force_group1_identity \
+  --separate_group_heads --separate_group_adapters --use_group_embedding \
+  --height 512 --width 512 --image_mode rgb --sfo_mode hsv \
+  --crop_mode full --crop_margin 32 \
+  --encoder_arch residual \
+  --encoder_channels 64 96 128 192 256 \
+  --encoder_blocks_per_stage 2 2 2 2 2 \
+  --encoder_base_channels 24 --encoder_depth 5 \
+  --feature_width 64 --correlation_feature_width 96 \
+  --cost_hidden_channels 48 --cost_volume_radii 8 6 4 \
+  --cost_pool_size 4 --correlation_temperature 0.07 \
+  --latent_dim 384 --group_embedding_dim 32 --norm_type group \
+  --model_scale_range 0.8 1.2 --translation_limit 0.5 \
+  --max_rotation_deg 20 \
+  --synthetic_prob 1.0 --val_synthetic_prob 1.0 \
+  --tx_range -64 64 --ty_range -64 64 \
+  --rot_range -15 15 --scale_range 0.85 1.15 \
+  --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
+  --charbonnier_weight 0.1 --gradient_weight 0.1 \
+  --overlap_weight 0.5 --reg_weight 0.0 \
+  --corr_displacement_weight 1.0 \
+  --corr_distribution_weight 0.25 \
+  --corr_confidence_weight 0.1 \
+  --corr_target_sigma 1.0 \
+  --student_corr_weight 1.0 --teacher_corr_weight 1.0 \
+  --epochs 1000 --batch_size 4 --lr 0.0003 \
+  --weight_decay 0.00001 --grad_clip 1.0 \
+  --val_split 0.15 --split_seed 2026 \
+  --n_workers 8 --amp --gpu_ids 0,1 \
+  --wandb_project registration \
+  --wandb_run_name correlation_volume_residual_direct_corr_stage1
+```
+
+```
+python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
+--registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+--unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
+--output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_residual_corr_raw_1024 \
+--best_checkpoint_name best_model.pt --last_checkpoint_name last_model.pt \
+--use_teacher_branch --frontend_mode raw --group_input_mode overlay \
+--affine_head_mode separated \
+--teacher_distill_weight 1.0 --detach_teacher --teacher_warmup_epochs 50 \
+--no-include_group1 --force_group1_identity --separate_group_heads --separate_group_adapters --use_group_embedding \
+--height 1024 --width 1024 --image_mode rgb --sfo_mode hsv \
+--crop_mode full --crop_margin 32 \
+--encoder_arch residual --encoder_channels 64 96 128 192 256 \
+--encoder_blocks_per_stage 2 2 2 2 2 --encoder_base_channels 24 \
+--encoder_depth 5 --feature_width 64 --correlation_feature_width 128 \
+--cost_hidden_channels 48 --cost_volume_radii 8 6 4 --cost_pool_size 4 \
+--correlation_temperature 0.07 --latent_dim 512 \
+--group_embedding_dim 32 --norm_type group --model_scale_range 0.8 1.2 \
+--translation_limit 0.5 --max_rotation_deg 20 --synthetic_prob 1.0 \
+--val_synthetic_prob 1.0 --tx_range -64 64 \
+--ty_range -64 64 --rot_range -15 15 --scale_range 0.85 1.15 \
+--param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
+--charbonnier_weight 0.1 --gradient_weight 0.1 --overlap_weight 0.5 --reg_weight 0.0 \
+--corr_displacement_weight 1.0 --corr_distribution_weight 0.50 \
+--corr_confidence_weight 0.1 --corr_target_sigma 1.0 --student_corr_weight 1.0 \
+--teacher_corr_weight 1.0 --epochs 1000 --batch_size 4 --lr 0.0003 \
+--weight_decay 0.00001 --grad_clip 1.0 --val_split 0.15 --split_seed 2026 \
+--n_workers 8 --amp --gpu_ids 0,1 \
+--wandb_project registration --wandb_run_name correlation_volume_residual_direct_corr_stage1
+```
+The numerical correspondence weights above are a starting point, not a claim
+that their scales are interchangeable. Compare the separately logged branch correspondence displacement, distribution,
+and confidence terms before
+retuning them.
+
+### Encoder/correspondence ablation matrix
+
+Keep the data split, frontend, affine head, radii, optimizer, and image losses
+identical. The following compact matrix isolates the additions; `FW` denotes
+`--feature_width`.
+
+| Experiment | Encoder flags | Correlation projection | Direct correspondence flags |
+| --- | --- | --- | --- |
+| Legacy baseline | `--encoder_arch current`; omit channels/blocks | `--correlation_feature_width 48` with `FW=48` | all three component weights `0` |
+| Projection only | same current encoder | `--correlation_feature_width 96` with `FW=48` | all three component weights `0` |
+| Residual only | `--encoder_arch residual --encoder_channels 64 96 128 192 256 --encoder_blocks_per_stage 2 2 2 2 2` | set correlation width equal to `FW` | all three component weights `0` |
+| Correspondence only | same current encoder | correlation width equal to `FW` | `--corr_displacement_weight 1 --corr_distribution_weight 0.25 --corr_confidence_weight 0.1` |
+| Residual + projection + correspondence | residual flags above | `--feature_width 64 --correlation_feature_width 96` | the three nonzero weights above |
+
+For a branch ablation, retain the component weights and use
+`--student_corr_weight 1 --teacher_corr_weight 0` for student-only cost
+supervision, `--student_corr_weight 0 --teacher_corr_weight 1` for teacher-only
+supervision, and set both to `1` for both. A zero branch multiplier does not alter that branch architecture.
 
 ## Teacher-focused frontend ablations
 
@@ -860,15 +1148,63 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
   --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
   --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20 \
-  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024_param20/best_model.pt \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage2_residual_corr_raw \
+  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_residual_corr_raw/best_model.pt \
   --best_checkpoint_name stage2_best_model.pt \
   --last_checkpoint_name stage2_last_model.pt \
   --use_teacher_branch \
   --frontend_mode raw --group_input_mode overlay \
   --affine_head_mode separated \
-  --teacher_distill_weight 1.0 \
-  --detach_teacher \
+  --teacher_distill_weight 1.0 --detach_teacher \
+  --teacher_warmup_epochs 200 \
+  --no-include_group1 --force_group1_identity \
+  --structural_distance_scale 0.03 \
+  --structural_context_scale 0.03 \
+  --structural_skeleton_radius 4 \
+  --separate_group_heads --separate_group_adapters --use_group_embedding \
+  --height 512 --width 512 --image_mode rgb --sfo_mode hsv \
+  --crop_mode full --crop_margin 32 \
+  --encoder_arch residual \
+  --encoder_channels 64 96 128 192 256 \
+  --encoder_blocks_per_stage 2 2 2 2 2 \
+  --encoder_base_channels 24 --encoder_depth 5 \
+  --feature_width 64 --correlation_feature_width 96 \
+  --cost_hidden_channels 48 --cost_volume_radii 8 6 4 \
+  --cost_pool_size 4 --correlation_temperature 0.07 \
+  --latent_dim 384 --group_embedding_dim 32 --norm_type group \
+  --model_scale_range 0.8 1.2 --translation_limit 0.5 \
+  --max_rotation_deg 20 \
+  --synthetic_prob 0.0 --val_synthetic_prob 0.0 \
+  --tx_range -64 64 --ty_range -64 64 \
+  --rot_range -15 15 --scale_range 0.85 1.15 \
+  --param_weight 0.0 \
+  --ncc_weight 1.0 --edge_weight 0.25 \
+  --charbonnier_weight 0.1 --gradient_weight 0.1 \
+  --overlap_weight 0.5 --reg_weight 0.01 \
+  --corr_displacement_weight 0.0 \
+  --corr_distribution_weight 0.0 \
+  --corr_confidence_weight 0.0 \
+  --corr_target_sigma 1.0 \
+  --student_corr_weight 1.0 --teacher_corr_weight 1.0 \
+  --epochs 800 --batch_size 4 --lr 0.00001 \
+  --weight_decay 0.00001 --grad_clip 1.0 \
+  --val_split 0.15 --split_seed 2026 \
+  --n_workers 8 --amp --gpu_ids 0,1 \
+  --wandb_project registration \
+  --wandb_run_name correlation_volume_residual_stage2_real_teacher_adaptation
+```
+```
+python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
+  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
+  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage2_residual_corr_raw_1024 \
+  --resume_checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_residual_corr_raw_1024/best_model.pt \
+  --best_checkpoint_name stage2_best_model.pt \
+  --last_checkpoint_name stage2_last_model.pt \
+  --use_teacher_branch \
+  --frontend_mode raw --group_input_mode overlay \
+  --affine_head_mode separated \
+  --teacher_distill_weight 1.0 --detach_teacher \
   --teacher_warmup_epochs 50 \
   --no-include_group1 --force_group1_identity \
   --structural_distance_scale 0.03 \
@@ -877,26 +1213,35 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --separate_group_heads --separate_group_adapters --use_group_embedding \
   --height 1024 --width 1024 --image_mode rgb --sfo_mode hsv \
   --crop_mode full --crop_margin 32 \
-  --encoder_base_channels 24 --encoder_depth 5 --feature_width 48 \
-  --cost_hidden_channels 48 --cost_volume_radii 6 5 4 \
-  --cost_pool_size 2 --correlation_temperature 0.07 \
-  --latent_dim 384 --group_embedding_dim 32 --norm_type group \
+  --encoder_arch residual \
+  --encoder_channels 64 96 128 192 256 \
+  --encoder_blocks_per_stage 2 2 2 2 2 \
+  --encoder_base_channels 24 --encoder_depth 5 \
+  --feature_width 64 --correlation_feature_width 128 \
+  --cost_hidden_channels 48 --cost_volume_radii 8 6 4 \
+  --cost_pool_size 4 --correlation_temperature 0.07 \
+  --latent_dim 512 --group_embedding_dim 32 --norm_type group \
   --model_scale_range 0.8 1.2 --translation_limit 0.5 \
   --max_rotation_deg 20 \
-  --synthetic_prob 0.5 --val_synthetic_prob 0.0 \
-  --tx_range -64 64 --ty_range -100 100 \
+  --synthetic_prob 0.0 --val_synthetic_prob 0.0 \
+  --tx_range -64 64 --ty_range -64 64 \
   --rot_range -15 15 --scale_range 0.85 1.15 \
-  --param_weight 10.0 --ncc_weight 1.0 --edge_weight 0.25 \
-  --charbonnier_weight 0.1 --gradient_weight 0.1 \
+  --param_weight 0.0 \
+  --ncc_weight 1.0 --edge_weight 0.50 \
+  --charbonnier_weight 0.01 --gradient_weight 0.1 \
   --overlap_weight 1.0 --reg_weight 0.01 \
+  --corr_displacement_weight 0.0 \
+  --corr_distribution_weight 0.0 \
+  --corr_confidence_weight 0.0 \
+  --corr_target_sigma 1.0 \
+  --student_corr_weight 1.0 --teacher_corr_weight 1.0 \
   --epochs 400 --batch_size 4 --lr 0.00001 \
   --weight_decay 0.00001 --grad_clip 1.0 \
   --val_split 0.15 --split_seed 2026 \
   --n_workers 8 --amp --gpu_ids 0,1 \
   --wandb_project registration \
-  --wandb_run_name correlation_volume_teacher_student_stage2_teacher_adaptation
+  --wandb_run_name stage2_residual_corr_raw_1024
 ```
-
 For all-real teacher adaptation, keep the nonzero warmup and use
 `--synthetic_prob 0.0` with `--param_weight 0.0`; the teacher then learns
 exclusively from NCC, edge, Charbonnier, gradient, overlap, and regularization
@@ -922,6 +1267,10 @@ params = model(
 )
 ```
 
+Because `return_aux` is omitted, it remains `False`: inference returns only the
+student parameter tensor and does not materialize or require cost-volume targets.
+The registered-Mineral, moving-group, group-ID deployment contract is unchanged.
+
 Inference then calls the same
 `warp_model_space_group(moving_group, predicted_params)` function used by
 `save_validation_overlays()`. It always warps the observed moving tensor;
@@ -940,10 +1289,10 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --include_group1 \
   --batch_size 4 --n_workers 4 --device cuda --gpu_ids 0,1
 
-  python inference.py \
-  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/ablation_teacher_frontend_raw_separate_1024/best_model_student.pt\
+  python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/inference.py \
+  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/ckpt/stage1_residual_corr_raw_1024/best_model_student.pt\
   --unregistered_root /home/yec23006/projects/research/Registration/Data/Testdata/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Results/stage1
+  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/Inference/stage1_1024
 ```
 
 `model_space_group_overlays/<index>_<sample>_G<group>.png` is produced with the

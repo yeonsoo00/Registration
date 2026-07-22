@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import math
+
+from typing import Mapping, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -489,3 +491,430 @@ def bio_loss(
             (intensity[i : i + 1] * penalty_region).sum() / (penalty_region.sum() + eps)
         )
     return torch.stack(penalties).mean()
+
+
+def _cost_volume_displacements(
+    displacements: torch.Tensor,
+    *,
+    batch_size: int,
+    candidates: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a DP-safe BxKx2 displacement table in float32."""
+    if not isinstance(displacements, torch.Tensor):
+        raise TypeError("cost-volume displacements must be a tensor")
+    if displacements.ndim == 2:
+        if tuple(displacements.shape) != (candidates, 2):
+            raise ValueError(
+                "displacements must have shape Kx2 or BxKx2; got "
+                f"{tuple(displacements.shape)} for K={candidates}"
+            )
+        displacements = displacements.unsqueeze(0).expand(batch_size, -1, -1)
+    elif displacements.ndim == 3:
+        if tuple(displacements.shape) != (batch_size, candidates, 2):
+            raise ValueError(
+                "batched displacements must have shape BxKx2; got "
+                f"{tuple(displacements.shape)} for B={batch_size}, K={candidates}"
+            )
+    else:
+        raise ValueError(
+            "displacements must have shape Kx2 or BxKx2, got "
+            f"{tuple(displacements.shape)}"
+        )
+    if not displacements.is_floating_point():
+        raise TypeError("cost-volume displacements must be floating point")
+    displacements = displacements.detach().to(device=device, dtype=torch.float32)
+    if not bool(torch.isfinite(displacements).all()):
+        raise ValueError("cost-volume displacements contain non-finite values")
+    return displacements
+
+
+def _cost_volume_mask(
+    mask: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    name: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validate one auxiliary validity tensor and return a boolean mask."""
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if tuple(mask.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(mask.shape)}")
+    if mask.is_floating_point() and not bool(torch.isfinite(mask).all()):
+        raise ValueError(f"{name} contains non-finite values")
+    canonical = mask if mask.dtype == torch.bool else mask > 0.5
+    return canonical.detach().to(device=device)
+
+
+def _candidate_valid_from_level_masks(
+    fixed_valid: torch.Tensor,
+    moving_valid: torch.Tensor,
+    displacements: torch.Tensor,
+) -> torch.Tensor:
+    """Rebuild the integer-shift validity used by local correlation.
+
+    Model auxiliary output normally supplies candidate_valid directly. This
+    fallback follows the same fixed(x) versus moving(x+d) convention when
+    consuming an older or hand-built auxiliary record.
+    """
+    batch_size, _, height, width = fixed_valid.shape
+    candidates = displacements.shape[1]
+    identity = torch.eye(2, 3, device=fixed_valid.device, dtype=torch.float32)
+    fixed_grid = F.affine_grid(
+        identity.unsqueeze(0).expand(batch_size, -1, -1),
+        size=(batch_size, 1, height, width),
+        align_corners=True,
+    )
+    pixel_to_normalized = fixed_grid.new_tensor(
+        (2.0 / max(width - 1, 1), 2.0 / max(height - 1, 1))
+    )
+    candidate_grid = fixed_grid[:, None] + displacements[:, :, None, None] * (
+        pixel_to_normalized.view(1, 1, 1, 1, 2)
+    )
+    sampled = F.grid_sample(
+        moving_valid[:, None]
+        .expand(batch_size, candidates, 1, height, width)
+        .reshape(batch_size * candidates, 1, height, width)
+        .float(),
+        candidate_grid.reshape(batch_size * candidates, height, width, 2),
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
+    ).reshape(batch_size, candidates, height, width)
+    in_bounds = candidate_grid.abs().amax(dim=-1) <= 1.0 + 1e-6
+    return fixed_valid[:, 0, None] & in_bounds & (sampled > 0.5)
+
+
+def cost_volume_correspondence_targets(
+    level: Mapping[str, object],
+    params_true: torch.Tensor,
+    has_params: torch.Tensor,
+    sigma: float,
+) -> dict[str, torch.Tensor]:
+    """Construct direct local-cost-volume targets for one FPN level.
+
+    params_true is the existing moving-to-target registration parameter vector.
+    Its affine-grid matrix maps fixed/output coordinates to moving/input
+    coordinates, exactly matching C(x,d) = similarity(fixed(x), moving(x+d)).
+    Real samples are never passed through affine conversion, so their NaN label
+    sentinels remain unused behind has_params=False.
+    """
+    if (
+        not isinstance(sigma, (int, float))
+        or not math.isfinite(float(sigma))
+        or not float(sigma) > 0.0
+    ):
+        raise ValueError("corr_target_sigma must be positive")
+    sigma = float(sigma)
+    required = {
+        "probability",
+        "expected_displacement",
+        "confidence",
+        "displacements",
+        "fixed_valid",
+        "moving_valid",
+    }
+    missing = sorted(required.difference(level))
+    if missing:
+        raise KeyError("Cost-volume auxiliary level is missing: " + ", ".join(missing))
+
+    probability = level["probability"]
+    expected = level["expected_displacement"]
+    confidence = level["confidence"]
+    if not all(
+        isinstance(value, torch.Tensor) for value in (probability, expected, confidence)
+    ):
+        raise TypeError(
+            "probability, expected_displacement, and confidence must be tensors"
+        )
+    assert isinstance(probability, torch.Tensor)
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(confidence, torch.Tensor)
+    if probability.ndim != 4:
+        raise ValueError("probability must have shape BxKxHxW")
+    batch_size, candidates, height, width = probability.shape
+    if tuple(expected.shape) != (batch_size, 2, height, width):
+        raise ValueError(
+            "expected_displacement must have shape "
+            f"{(batch_size, 2, height, width)}, got {tuple(expected.shape)}"
+        )
+    if tuple(confidence.shape) != (batch_size, 1, height, width):
+        raise ValueError(
+            "confidence must have shape "
+            f"{(batch_size, 1, height, width)}, got {tuple(confidence.shape)}"
+        )
+    if not probability.is_floating_point() or not expected.is_floating_point():
+        raise TypeError("cost-volume predictions must be floating point")
+    if not confidence.is_floating_point():
+        raise TypeError("cost-volume confidence must be floating point")
+    if not bool(torch.isfinite(probability).all()):
+        raise ValueError("cost-volume probability contains non-finite values")
+    if not bool(torch.isfinite(expected).all()):
+        raise ValueError("expected_displacement contains non-finite values")
+    if not bool(torch.isfinite(confidence).all()):
+        raise ValueError("confidence contains non-finite values")
+
+    device = probability.device
+    if expected.device != device or confidence.device != device:
+        raise ValueError("All cost-volume auxiliary predictions must share one device")
+    if tuple(params_true.shape) != (batch_size, 5):
+        raise ValueError(
+            f"params_true must have shape {(batch_size, 5)}, got {tuple(params_true.shape)}"
+        )
+    synthetic = has_params.reshape(-1).bool()
+    if synthetic.numel() != batch_size:
+        raise ValueError(
+            f"has_params must contain {batch_size} values, got {synthetic.numel()}"
+        )
+    synthetic = synthetic.detach().to(device=device)
+    params_true = params_true.detach().to(device=device)
+    if synthetic.any() and not bool(torch.isfinite(params_true[synthetic]).all()):
+        raise ValueError("Every has_params=True sample must provide finite params_true")
+
+    fixed_valid = _cost_volume_mask(
+        level["fixed_valid"],
+        shape=(batch_size, 1, height, width),
+        name="fixed_valid",
+        device=device,
+    )
+    moving_valid = _cost_volume_mask(
+        level["moving_valid"],
+        shape=(batch_size, 1, height, width),
+        name="moving_valid",
+        device=device,
+    )
+    displacements = _cost_volume_displacements(
+        level["displacements"],
+        batch_size=batch_size,
+        candidates=candidates,
+        device=device,
+    )
+
+    identity = torch.eye(2, 3, device=device, dtype=torch.float32)
+    fixed_grid = F.affine_grid(
+        identity.unsqueeze(0).expand(batch_size, -1, -1),
+        size=(batch_size, 1, height, width),
+        align_corners=True,
+    )
+    moving_grid = fixed_grid.clone()
+    if synthetic.any():
+        from utils import affine_parameters_to_matrix
+
+        synthetic_indices = torch.nonzero(synthetic, as_tuple=False).reshape(-1)
+        matrices = affine_parameters_to_matrix(params_true[synthetic_indices].float())
+        moving_grid[synthetic_indices] = F.affine_grid(
+            matrices,
+            size=(synthetic_indices.numel(), 1, height, width),
+            align_corners=True,
+        )
+
+    normalized_to_pixel = fixed_grid.new_tensor(
+        (max(width - 1, 1) / 2.0, max(height - 1, 1) / 2.0)
+    )
+    true_displacement = (moving_grid - fixed_grid) * normalized_to_pixel
+    true_displacement = true_displacement.permute(0, 3, 1, 2).contiguous()
+    in_bounds = (moving_grid.abs().amax(dim=-1) <= 1.0 + 1e-6).unsqueeze(1)
+    sampled_moving_valid = (
+        F.grid_sample(
+            moving_valid.float(),
+            moving_grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        > 0.5
+    )
+    geometric_mask = (
+        synthetic[:, None, None, None] & fixed_valid & in_bounds & sampled_moving_valid
+    )
+
+    minimum = displacements.amin(dim=1)
+    maximum = displacements.amax(dim=1)
+    dx = true_displacement[:, 0:1]
+    dy = true_displacement[:, 1:2]
+    within_radius = (
+        (dx >= minimum[:, 0, None, None, None] - 1e-6)
+        & (dx <= maximum[:, 0, None, None, None] + 1e-6)
+        & (dy >= minimum[:, 1, None, None, None] - 1e-6)
+        & (dy <= maximum[:, 1, None, None, None] + 1e-6)
+    )
+    in_radius_mask = geometric_mask & within_radius
+
+    supplied_candidate_valid = level.get("candidate_valid")
+    if supplied_candidate_valid is None:
+        candidate_valid = _candidate_valid_from_level_masks(
+            fixed_valid, moving_valid, displacements
+        )
+    else:
+        candidate_valid = _cost_volume_mask(
+            supplied_candidate_valid,
+            shape=(batch_size, candidates, height, width),
+            name="candidate_valid",
+            device=device,
+        )
+        candidate_valid = candidate_valid & fixed_valid
+
+    delta = displacements[:, :, :, None, None] - true_displacement[:, None]
+    target_logits = -delta.square().sum(dim=2) / (2.0 * sigma * sigma)
+    negative_large = torch.finfo(target_logits.dtype).min
+    masked_logits = target_logits.masked_fill(~candidate_valid, negative_large)
+    maximum_logit = masked_logits.amax(dim=1, keepdim=True)
+    target_weight = torch.exp(masked_logits - maximum_logit) * candidate_valid
+    target_mass = target_weight.sum(dim=1, keepdim=True)
+    distribution_mask = in_radius_mask & (target_mass > 0.0)
+    target_probability = torch.where(
+        target_mass > 0.0,
+        target_weight / target_mass.clamp_min(torch.finfo(target_weight.dtype).tiny),
+        torch.zeros_like(target_weight),
+    )
+    target_probability = target_probability * distribution_mask.to(
+        target_probability.dtype
+    )
+
+    return {
+        "true_displacement": true_displacement,
+        "geometric_mask": geometric_mask,
+        "in_radius_mask": in_radius_mask,
+        "distribution_mask": distribution_mask,
+        "confidence_mask": geometric_mask,
+        "target_probability": target_probability,
+        "confidence_target": in_radius_mask.to(dtype=torch.float32),
+    }
+
+
+def cost_volume_correspondence_loss(
+    levels: Sequence[Mapping[str, object]],
+    params_true: torch.Tensor,
+    has_params: torch.Tensor,
+    sigma: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    """Return stable direct-correspondence losses and exact validity counts.
+
+    Each component is normalized by all of its valid pixels across the supplied
+    pyramid levels. Empty components return a finite graph-connected zero. The
+    per-level counts make validation aggregation and diagnostics explicit.
+    """
+    if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes)):
+        raise TypeError("levels must be a sequence of auxiliary level mappings")
+
+    level_zeros = []
+    for level_index, level in enumerate(levels):
+        if not isinstance(level, Mapping):
+            raise TypeError(f"levels[{level_index}] must be a mapping")
+        tensors = []
+        for name in ("probability", "expected_displacement", "confidence"):
+            value = level.get(name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"levels[{level_index}][{name!r}] must be a tensor")
+            tensors.append(value)
+        level_zeros.append(sum((value.sum() * 0.0 for value in tensors)))
+
+    if level_zeros:
+        differentiable_zero = torch.stack(level_zeros).sum()
+    else:
+        differentiable_zero = torch.zeros(
+            (),
+            device=params_true.device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+
+    names = ("displacement", "distribution", "confidence")
+    denominators = {name: 0 for name in names}
+    active_levels = {name: 0 for name in names}
+    per_level = {name: [0] * len(levels) for name in names}
+    numerators: dict[str, torch.Tensor] = {}
+    synthetic_samples = int(has_params.reshape(-1).bool().sum().item())
+
+    if synthetic_samples:
+        for level_index, level in enumerate(levels):
+            targets = cost_volume_correspondence_targets(
+                level,
+                params_true=params_true,
+                has_params=has_params,
+                sigma=sigma,
+            )
+            expected = level["expected_displacement"]
+            probability = level["probability"]
+            confidence = level["confidence"]
+            assert isinstance(expected, torch.Tensor)
+            assert isinstance(probability, torch.Tensor)
+            assert isinstance(confidence, torch.Tensor)
+
+            displacement_mask = targets["in_radius_mask"]
+            displacement_count = int(displacement_mask.sum().item())
+            per_level["displacement"][level_index] = displacement_count
+            if displacement_count:
+                error = F.smooth_l1_loss(
+                    expected.float(),
+                    targets["true_displacement"],
+                    beta=1.0,
+                    reduction="none",
+                ).mean(dim=1, keepdim=True)
+                numerator = (error * displacement_mask).sum()
+                numerators["displacement"] = (
+                    numerators.get("displacement", numerator.new_zeros(())) + numerator
+                )
+                denominators["displacement"] += displacement_count
+                active_levels["displacement"] += 1
+
+            distribution_mask = targets["distribution_mask"]
+            distribution_count = int(distribution_mask.sum().item())
+            per_level["distribution"][level_index] = distribution_count
+            if distribution_count:
+                probability_float = probability.float()
+                epsilon = torch.finfo(probability_float.dtype).eps
+                cross_entropy = -(
+                    targets["target_probability"]
+                    * torch.log(probability_float.clamp_min(epsilon))
+                ).sum(dim=1, keepdim=True)
+                numerator = (cross_entropy * distribution_mask).sum()
+                numerators["distribution"] = (
+                    numerators.get("distribution", numerator.new_zeros(())) + numerator
+                )
+                denominators["distribution"] += distribution_count
+                active_levels["distribution"] += 1
+
+            confidence_mask = targets["confidence_mask"]
+            confidence_count = int(confidence_mask.sum().item())
+            per_level["confidence"][level_index] = confidence_count
+            if confidence_count:
+                confidence_float = confidence.float()
+                epsilon = torch.finfo(confidence_float.dtype).eps
+                # ``confidence`` is already a probability (the maximum local
+                # correspondence probability), so there is no upstream sigmoid
+                # logit to consume directly. Convert the clamped probability to
+                # its exact logit and use the autocast-safe fused loss. This is
+                # mathematically equivalent to BCE(probability, target),
+                # including its gradient with respect to the probability.
+                confidence_probability = confidence_float.clamp(epsilon, 1.0 - epsilon)
+                confidence_logits = torch.logit(confidence_probability)
+                confidence_error = F.binary_cross_entropy_with_logits(
+                    confidence_logits,
+                    targets["confidence_target"].float(),
+                    reduction="none",
+                )
+                numerator = (confidence_error * confidence_mask).sum()
+                numerators["confidence"] = (
+                    numerators.get("confidence", numerator.new_zeros(())) + numerator
+                )
+                denominators["confidence"] += confidence_count
+                active_levels["confidence"] += 1
+
+    losses = {
+        name: (
+            numerators[name] / denominators[name]
+            if denominators[name]
+            else differentiable_zero
+        )
+        for name in names
+    }
+    counts: dict[str, object] = {
+        **denominators,
+        **{f"{name}_levels": count for name, count in active_levels.items()},
+        **{f"{name}_per_level": values for name, values in per_level.items()},
+        "synthetic_samples": synthetic_samples,
+        "levels": len(levels),
+    }
+    return losses, counts

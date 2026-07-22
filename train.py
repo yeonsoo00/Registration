@@ -25,6 +25,7 @@ from dataset import MAX_GROUP_STAINS, CartilageDataset
 from losses import (
     affine_control_point_loss,
     charbonnier_loss,
+    cost_volume_correspondence_loss,
     gradient_ncc_loss,
     multiscale_gradient_loss,
     multiscale_local_ncc_loss,
@@ -33,7 +34,9 @@ from losses import (
 )
 from models import (
     AFFINE_HEAD_MODES,
+    DEFAULT_CORRELATION_FEATURE_WIDTH,
     DEFAULT_GROUP_SLOTS,
+    ENCODER_ARCHES,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
     TEACHER_FIXED_INPUT_VERSION,
@@ -69,6 +72,11 @@ AFFINE_ERROR_COMPONENT_NAMES = frozenset(
     f"{path_name}_{metric_name}"
     for path_name in ("student", "teacher")
     for metric_name in AFFINE_ERROR_METRIC_NAMES
+)
+CORRESPONDENCE_COMPONENT_NAMES = (
+    "displacement",
+    "distribution",
+    "confidence",
 )
 
 # Only these tensors participate in model prediction or loss computation.
@@ -151,7 +159,39 @@ def parse_args():
     )
     p.add_argument("--encoder_base_channels", type=int, default=24)
     p.add_argument("--encoder_depth", type=int, default=5)
+    p.add_argument(
+        "--encoder_arch",
+        choices=ENCODER_ARCHES,
+        default="current",
+        help="Shared Siamese FPN bottom-up encoder architecture",
+    )
+    p.add_argument(
+        "--encoder_channels",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "One channel width per encoder stage. When omitted, current uses "
+            "the legacy base/depth schedule and residual uses 64 96 128 192 256."
+        ),
+    )
+    p.add_argument(
+        "--encoder_blocks_per_stage",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "One residual-block count for all stages or one count per stage; "
+            "residual mode defaults to 2 2 2 2 2."
+        ),
+    )
     p.add_argument("--feature_width", type=int, default=48)
+    p.add_argument(
+        "--correlation_feature_width",
+        type=int,
+        default=None,
+        help="Per-level projected feature width before correlation (default: 96)",
+    )
     p.add_argument("--cost_hidden_channels", type=int, default=48)
     p.add_argument("--cost_volume_radii", type=int, nargs="+", default=[4, 4, 4])
     p.add_argument("--cost_pool_size", type=int, default=4)
@@ -191,6 +231,12 @@ def parse_args():
     p.add_argument("--gradient_weight", type=float, default=0.1)
     p.add_argument("--overlap_weight", type=float, default=0.5)
     p.add_argument("--reg_weight", type=float, default=0.0)
+    p.add_argument("--corr_displacement_weight", type=float, default=0.0)
+    p.add_argument("--corr_distribution_weight", type=float, default=0.0)
+    p.add_argument("--corr_confidence_weight", type=float, default=0.0)
+    p.add_argument("--corr_target_sigma", type=float, default=1.0)
+    p.add_argument("--student_corr_weight", type=float, default=1.0)
+    p.add_argument("--teacher_corr_weight", type=float, default=1.0)
     p.add_argument(
         "--use_teacher_branch",
         action=argparse.BooleanOptionalAction,
@@ -535,6 +581,68 @@ def parameter_supervision_mask(params, params_true, has_params):
     return mask
 
 
+def correspondence_loss_weights(a):
+    """Return the three direct cost-volume component weights."""
+    return {
+        "displacement": float(getattr(a, "corr_displacement_weight", 0.0)),
+        "distribution": float(getattr(a, "corr_distribution_weight", 0.0)),
+        "confidence": float(getattr(a, "corr_confidence_weight", 0.0)),
+    }
+
+
+def correspondence_enabled(a, branch_name):
+    """Return whether one branch has an active correspondence objective."""
+    if branch_name not in {"student", "teacher"}:
+        raise ValueError("branch_name must be student or teacher")
+    branch_weight = float(getattr(a, f"{branch_name}_corr_weight", 1.0))
+    return branch_weight > 0.0 and any(
+        weight > 0.0 for weight in correspondence_loss_weights(a).values()
+    )
+
+
+def correspondence_aux_requested(a, batch, branch_name):
+    """Request large cost-volume tensors only for labeled active branches."""
+    return correspondence_enabled(a, branch_name) and bool(
+        batch["has_params"].reshape(-1).bool().any()
+    )
+
+
+def unpack_branch_prediction(output):
+    """Extract Bx5 parameters while preserving optional level diagnostics."""
+    if torch.is_tensor(output):
+        return output, None
+    if not isinstance(output, dict):
+        raise TypeError("A branch must return a tensor or an auxiliary dictionary")
+    params = output.get("params")
+    levels = output.get("levels")
+    if not torch.is_tensor(params) or not isinstance(levels, list):
+        raise ValueError("Auxiliary branch output requires tensor params and levels")
+    return params, levels
+
+
+def branch_correspondence_loss(a, levels, batch, branch_name):
+    """Compute and weight direct correspondence supervision for one branch."""
+    if levels is None:
+        raise ValueError(f"{branch_name} correspondence loss requires return_aux=True")
+    raw_losses, counts = cost_volume_correspondence_loss(
+        levels,
+        params_true=batch["params_true"],
+        has_params=batch["has_params"],
+        sigma=float(getattr(a, "corr_target_sigma", 1.0)),
+    )
+    weights = correspondence_loss_weights(a)
+    branch_weight = float(getattr(a, f"{branch_name}_corr_weight", 1.0))
+    weighted = torch.stack(
+        [weights[name] * raw_losses[name] for name in CORRESPONDENCE_COMPONENT_NAMES]
+    ).sum()
+    total = branch_weight * weighted
+    components = {
+        f"corr_{name}": raw_losses[name] for name in CORRESPONDENCE_COMPONENT_NAMES
+    }
+    components["corr_total"] = total
+    return total, components, counts
+
+
 def grouped_loss(
     a,
     *,
@@ -546,6 +654,7 @@ def grouped_loss(
     params_true,
     has_params,
     valid_overlap,
+    allow_empty=False,
 ):
     """Compare warped moving stains with train-only registered targets."""
     valid = valid_group.bool()
@@ -623,7 +732,11 @@ def grouped_loss(
         "reg": a.reg_weight,
     }
     if not losses:
-        raise ValueError("At least one applicable loss weight must be non-zero")
+        if not allow_empty:
+            raise ValueError("At least one applicable loss weight must be non-zero")
+        total = params.sum() * 0.0
+        losses["total"] = total
+        return total, losses
     total = torch.stack([weights[name] * value for name, value in losses.items()]).sum()
     losses["total"] = total
     return total, losses
@@ -644,19 +757,23 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
     with torch.no_grad():
         for batch in loader:
             batch = move_required_tensors(batch, device)
+            request_correspondence = correspondence_aux_requested(a, batch, path_name)
             if teacher:
-                params = model.forward_teacher(
+                output = model.forward_teacher(
                     fixed_mineral=batch["fixed_mineral"],
                     target_group=batch["target_group"],
                     moving_group=batch["moving_group"],
                     group=batch["group_id"],
+                    return_aux=request_correspondence,
                 )
             else:
-                params = model(
+                output = model(
                     fixed_mineral=batch["fixed_mineral"],
                     moving_group=batch["moving_group"],
                     group=batch["group_id"],
+                    return_aux=request_correspondence,
                 )
+            params, correspondence_levels = unpack_branch_prediction(output)
             warped = warp_group_for_supervision(
                 batch["moving_group"],
                 batch["target_group"],
@@ -672,7 +789,7 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
                 params_true=batch["params_true"],
                 has_params=batch["has_params"],
             )
-            _, losses = grouped_loss(
+            path_total, losses = grouped_loss(
                 a,
                 params=params,
                 warped_group=warped,
@@ -682,7 +799,18 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
                 params_true=batch["params_true"],
                 has_params=batch["has_params"],
                 valid_overlap=valid_overlap,
+                allow_empty=correspondence_enabled(a, path_name),
             )
+            if request_correspondence:
+                corr_total, corr_components, _ = branch_correspondence_loss(
+                    a,
+                    correspondence_levels,
+                    batch,
+                    path_name,
+                )
+                path_total = path_total + corr_total
+                losses.update(corr_components)
+                losses["total"] = path_total
             batch_size = params.shape[0]
             has_parameters = parameter_supervision_mask(
                 params, batch["params_true"], batch["has_params"]
@@ -691,7 +819,7 @@ def evaluate_path(a, model, loader, device, *, path_name, teacher=False):
             unlabeled_count = batch_size - labeled_count
             for name, value in losses.items():
                 metric_name = f"val_{path_name}_{name}"
-                if name == "param":
+                if name == "param" or name.startswith("corr_"):
                     metric_count = labeled_count
                 elif name == "reg":
                     metric_count = unlabeled_count
@@ -771,17 +899,159 @@ def evaluate(a, model, loader, device):
     return metrics
 
 
+ENCODER_MIGRATION_CONFIG_KEYS = frozenset(
+    {
+        "encoder_arch",
+        "encoder_channels",
+        "encoder_blocks_per_stage",
+        "encoder_depth",
+        "correlation_feature_width",
+    }
+)
+FLAT_ENCODER_CONFIG_KEYS = (
+    "encoder_arch",
+    "encoder_channels",
+    "encoder_blocks_per_stage",
+    "correlation_feature_width",
+)
+
+
+def _config_differences(saved, expected):
+    saved = saved or {}
+    expected = expected or {}
+    return {
+        key: (saved.get(key), expected.get(key))
+        for key in sorted(set(saved) | set(expected))
+        if saved.get(key) != expected.get(key)
+    }
+
+
+def _format_config_differences(differences):
+    return ", ".join(
+        f"{key}={saved!r}->{expected!r}"
+        for key, (saved, expected) in differences.items()
+    )
+
+
+def _checkpoint_load_mode(saved, expected):
+    """Return strict or the one explicitly supported encoder migration mode."""
+    if expected is None:
+        return "strict"
+    differences = _config_differences(saved, expected)
+    if not differences:
+        return "strict"
+
+    saved_arch = (saved or {}).get("encoder_arch")
+    expected_arch = expected.get("encoder_arch")
+    unrelated = sorted(set(differences) - ENCODER_MIGRATION_CONFIG_KEYS)
+    if saved_arch == "current" and expected_arch == "residual" and not unrelated:
+        print("Checkpoint encoder migration explicitly enabled: current -> residual")
+        print("Changed encoder settings:")
+        for key, (saved_value, expected_value) in differences.items():
+            print(f"  {key}: {saved_value!r} -> {expected_value!r}")
+        return "current_to_residual"
+
+    details = _format_config_differences(differences)
+    if saved_arch == "current" and expected_arch == "residual" and unrelated:
+        raise ValueError(
+            "Current-to-residual migration cannot change non-encoder settings: "
+            + ", ".join(unrelated)
+            + ". Differences: "
+            + details
+        )
+    raise ValueError(
+        "Correlation checkpoint student_model_config differs from this run. "
+        "Only an explicit current-to-residual encoder migration is supported. "
+        "Differences: " + details
+    )
+
+
 def _require_matching_config(name, saved, expected):
     if expected is None or saved == expected:
         return
-    saved = saved or {}
-    changed = sorted(
-        key for key in set(saved) | set(expected) if saved.get(key) != expected.get(key)
+    differences = _config_differences(saved, expected)
+    raise ValueError(
+        f"Correlation checkpoint {name} differs from this run: "
+        + _format_config_differences(differences)
     )
 
-    raise ValueError(
-        f"Correlation checkpoint {name} differs from this run: " + ", ".join(changed)
+
+def _state_without_data_parallel_prefix(state):
+    return OrderedDict(
+        (key[7:] if key.startswith("module.") else key, value)
+        for key, value in state.items()
     )
+
+
+def _print_key_list(title, keys):
+    print(f"{title} ({len(keys)}):")
+    if not keys:
+        print("  <none>")
+        return
+    for key in keys:
+        print(f"  {key}")
+
+
+def _load_migrated_branch_state(branch, source_state, branch_name):
+    """Load shape-compatible tensors and report every non-strict decision."""
+    destination = _branch_module(branch)
+    destination_state = destination.state_dict()
+    compatible = OrderedDict()
+    unexpected = []
+    shape_mismatches = []
+    for key, value in source_state.items():
+        if key not in destination_state:
+            unexpected.append(key)
+            continue
+        expected_value = destination_state[key]
+        if tuple(value.shape) != tuple(expected_value.shape):
+            shape_mismatches.append(
+                (key, tuple(value.shape), tuple(expected_value.shape))
+            )
+            continue
+        compatible[key] = value
+
+    newly_initialized_by_filter = sorted(set(destination_state) - set(compatible))
+    allowed_prefixes = (
+        "encoder.shared_encoder.",
+        "encoder.correlation_projections.",
+    )
+    unsafe_new = [
+        key
+        for key in newly_initialized_by_filter
+        if not key.startswith(allowed_prefixes)
+    ]
+    unsafe_old = [key for key in unexpected if not key.startswith(allowed_prefixes)]
+    unsafe_shapes = [
+        key for key, _, _ in shape_mismatches if not key.startswith(allowed_prefixes)
+    ]
+    if unsafe_new or unsafe_old or unsafe_shapes:
+        raise RuntimeError(
+            f"Unsafe {branch_name} checkpoint migration touched non-encoder keys: "
+            f"new={unsafe_new}, unexpected={unsafe_old}, shape_mismatch={unsafe_shapes}"
+        )
+
+    incompatible = destination.load_state_dict(compatible, strict=False)
+    newly_initialized = sorted(incompatible.missing_keys)
+    loader_unexpected = sorted(incompatible.unexpected_keys)
+    if loader_unexpected:
+        raise AssertionError(
+            "Filtered migration unexpectedly passed unknown keys: "
+            + ", ".join(loader_unexpected)
+        )
+
+    print(f"Checkpoint migration report for {branch_name} branch:")
+    _print_key_list("  loaded shape-compatible keys", sorted(compatible))
+    _print_key_list("  newly initialized destination keys", newly_initialized)
+    _print_key_list("  unexpected checkpoint keys", sorted(unexpected))
+    print(f"  shape-mismatched checkpoint keys ({len(shape_mismatches)}):")
+    if not shape_mismatches:
+        print("    <none>")
+    else:
+        for key, saved_shape, destination_shape in shape_mismatches:
+            print(
+                f"    {key}: checkpoint{saved_shape} -> initialized{destination_shape}"
+            )
 
 
 def load_initial_weights(
@@ -845,10 +1115,8 @@ def load_initial_weights(
         if expected_student_model_config is None
         else canonicalize_model_config(expected_student_model_config)
     )
-    _require_matching_config(
-        "student_model_config",
-        saved_student_model_config,
-        canonical_expected_student_model_config,
+    checkpoint_load_mode = _checkpoint_load_mode(
+        saved_student_model_config, canonical_expected_student_model_config
     )
     _require_matching_config(
         "preprocess_config",
@@ -860,24 +1128,96 @@ def load_initial_weights(
     if saved_teacher_presence and "teacher_model_state_dict" not in checkpoint:
         raise ValueError("Full teacher checkpoint is missing teacher_model_state_dict")
 
-    student_state = OrderedDict(
-        (key[7:] if key.startswith("module.") else key, value)
-        for key, value in checkpoint["student_model_state_dict"].items()
+    student_state = _state_without_data_parallel_prefix(
+        checkpoint["student_model_state_dict"]
     )
-    try:
-        _branch_module(model.student).load_state_dict(student_state, strict=True)
-        if saved_teacher_presence:
-            teacher_state = OrderedDict(
-                (key[7:] if key.startswith("module.") else key, value)
-                for key, value in checkpoint["teacher_model_state_dict"].items()
-            )
-            _branch_module(model.teacher).load_state_dict(teacher_state, strict=True)
-    except RuntimeError as error:
-        raise RuntimeError(
-            "Teacher/student checkpoint mismatch. Stage 2 must retain teacher "
-            "presence and every student architecture/descriptor flag from Stage 1."
-        ) from error
+    teacher_state = (
+        _state_without_data_parallel_prefix(checkpoint["teacher_model_state_dict"])
+        if saved_teacher_presence
+        else None
+    )
+    if checkpoint_load_mode == "current_to_residual":
+        _load_migrated_branch_state(model.student, student_state, "student")
+        if teacher_state is not None:
+            if model.teacher is None:
+                raise ValueError(
+                    "Checkpoint contains a teacher but this model does not"
+                )
+            _load_migrated_branch_state(model.teacher, teacher_state, "teacher")
+    else:
+        try:
+            _branch_module(model.student).load_state_dict(student_state, strict=True)
+            if teacher_state is not None:
+                if model.teacher is None:
+                    raise ValueError(
+                        "Checkpoint contains a teacher but this model does not"
+                    )
+                _branch_module(model.teacher).load_state_dict(
+                    teacher_state, strict=True
+                )
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Teacher/student checkpoint mismatch. Strict loading is required "
+                "unless encoder_arch explicitly changes from current to residual."
+            ) from error
     return checkpoint
+
+
+def _resume_student_model_config(checkpoint_path):
+    """Read canonical model metadata before constructing a resumed model."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    architecture = checkpoint.get("architecture")
+    if architecture != ARCHITECTURE:
+        raise ValueError(
+            "--resume_checkpoint must be a full TeacherStudent checkpoint with "
+            f"architecture={ARCHITECTURE!r}, got {architecture!r}"
+        )
+    if checkpoint.get("checkpoint_type") != "full_training":
+        raise ValueError(
+            "--resume_checkpoint requires the full training checkpoint, not the "
+            "student-only inference artifact"
+        )
+    if "student_model_config" not in checkpoint:
+        raise ValueError("Full checkpoint is missing student_model_config")
+    return canonicalize_model_config(checkpoint["student_model_config"])
+
+
+def resolve_encoder_args(a):
+    """Resolve defaults and inherit omitted settings for strict same-arch resume."""
+    saved = (
+        _resume_student_model_config(a.resume_checkpoint)
+        if a.resume_checkpoint
+        else None
+    )
+    same_architecture = saved is not None and saved["encoder_arch"] == a.encoder_arch
+    channels = a.encoder_channels
+    blocks = a.encoder_blocks_per_stage
+    correlation_width = a.correlation_feature_width
+    if same_architecture:
+        if channels is None:
+            channels = saved["encoder_channels"]
+        if blocks is None:
+            blocks = saved["encoder_blocks_per_stage"]
+        if correlation_width is None:
+            correlation_width = saved["correlation_feature_width"]
+    elif correlation_width is None:
+        correlation_width = DEFAULT_CORRELATION_FEATURE_WIDTH
+
+    resolved = canonicalize_model_config(
+        {
+            "encoder_arch": a.encoder_arch,
+            "encoder_channels": channels,
+            "encoder_blocks_per_stage": blocks,
+            "encoder_base_channels": a.encoder_base_channels,
+            "encoder_depth": a.encoder_depth,
+            "feature_width": a.feature_width,
+            "correlation_feature_width": correlation_width,
+        }
+    )
+    a.encoder_channels = resolved["encoder_channels"]
+    a.encoder_blocks_per_stage = resolved["encoder_blocks_per_stage"]
+    a.encoder_depth = resolved["encoder_depth"]
+    a.correlation_feature_width = resolved["correlation_feature_width"]
 
 
 def validate_args(a):
@@ -913,16 +1253,43 @@ def validate_args(a):
         raise ValueError("grad_clip must be positive")
     if a.max_train_items < 0 or a.max_val_items < 0:
         raise ValueError("max_train_items and max_val_items cannot be negative")
+    if a.encoder_arch not in ENCODER_ARCHES:
+        raise ValueError("encoder_arch must be one of " + ", ".join(ENCODER_ARCHES))
     if a.encoder_base_channels < 8:
         raise ValueError("encoder_base_channels must be at least 8")
+    configured_channels = a.encoder_channels
+    if configured_channels is not None:
+        if not configured_channels or any(
+            channel < 1 for channel in configured_channels
+        ):
+            raise ValueError("encoder_channels must contain positive integers")
+        encoder_stage_count = len(configured_channels)
+    else:
+        encoder_stage_count = a.encoder_depth if a.encoder_arch == "current" else 5
+    configured_blocks = a.encoder_blocks_per_stage
+    if configured_blocks is not None:
+        if not configured_blocks or any(block < 1 for block in configured_blocks):
+            raise ValueError("encoder_blocks_per_stage must contain positive integers")
+        if len(configured_blocks) not in (1, encoder_stage_count):
+            raise ValueError(
+                "encoder_blocks_per_stage must contain one value or one per stage"
+            )
+        if a.encoder_arch != "residual":
+            raise ValueError(
+                "encoder_blocks_per_stage is only used with encoder_arch=residual"
+            )
+    if a.correlation_feature_width is not None and a.correlation_feature_width < 1:
+        raise ValueError("correlation_feature_width must be positive")
     if a.feature_width < 8 or a.cost_hidden_channels < 8:
         raise ValueError("feature_width and cost_hidden_channels must be at least 8")
     if not a.cost_volume_radii:
         raise ValueError("cost_volume_radii cannot be empty")
     if any(radius < 1 or radius > 8 for radius in a.cost_volume_radii):
         raise ValueError("Every cost-volume radius must be in [1, 8]")
-    if a.encoder_depth < len(a.cost_volume_radii) + 2:
-        raise ValueError("encoder_depth must be at least len(cost_volume_radii) + 2")
+    if encoder_stage_count < len(a.cost_volume_radii) + 2:
+        raise ValueError(
+            "encoder_channels must provide at least len(cost_volume_radii) + 2 stages"
+        )
     if a.cost_pool_size < 1:
         raise ValueError("cost_pool_size must be positive")
     if a.correlation_temperature <= 0.0:
@@ -968,14 +1335,17 @@ def validate_args(a):
     if (
         a.use_teacher_branch
         and (a.detach_teacher or a.freeze_teacher)
-        and (a.synthetic_prob == 0.0 or a.param_weight == 0.0)
+        and not (
+            a.synthetic_prob > 0.0
+            and (a.param_weight > 0.0 or correspondence_enabled(a, "teacher"))
+        )
         and a.teacher_warmup_epochs == 0
         and not a.resume_checkpoint
     ):
         raise ValueError(
-            "A detached teacher with neither parameter supervision nor an "
-            "image-supervised warmup must resume a full checkpoint containing "
-            "a trained teacher"
+            "A detached teacher with neither parameter/correspondence "
+            "supervision nor an image-supervised warmup must resume a full "
+            "checkpoint containing a trained teacher"
         )
     loss_weights = (
         a.param_weight,
@@ -985,9 +1355,18 @@ def validate_args(a):
         a.gradient_weight,
         a.overlap_weight,
         a.reg_weight,
+        a.corr_displacement_weight,
+        a.corr_distribution_weight,
+        a.corr_confidence_weight,
+        a.student_corr_weight,
+        a.teacher_corr_weight,
     )
     if any(weight < 0 for weight in loss_weights):
         raise ValueError("Loss weights cannot be negative")
+    if any(not np.isfinite(weight) for weight in loss_weights):
+        raise ValueError("Loss weights must be finite")
+    if not np.isfinite(a.corr_target_sigma) or a.corr_target_sigma <= 0.0:
+        raise ValueError("corr_target_sigma must be positive and finite")
     for name in (a.best_checkpoint_name, a.last_checkpoint_name):
         if os.path.basename(name) != name or not name.endswith(".pt"):
             raise ValueError(
@@ -1061,6 +1440,8 @@ def save_checkpoint_pair(
             "use_teacher_branch": model.teacher is not None,
         }
     )
+    for key in FLAT_ENCODER_CONFIG_KEYS:
+        full_model_config[key] = student_model_config[key]
     if teacher_state is not None:
         full_model_config["teacher_fixed_input_version"] = TEACHER_FIXED_INPUT_VERSION
     full_payload.update(
@@ -1130,13 +1511,18 @@ def teacher_distillation_weight(a, epoch):
 def compute_training_loss(a, model, batch, epoch):
     """Compute the phase-correct student/teacher training objective."""
     teacher_only = teacher_warmup_active(a, epoch)
+    student_requests_corr = not teacher_only and correspondence_aux_requested(
+        a, batch, "student"
+    )
     student_context = torch.no_grad() if teacher_only else nullcontext()
     with student_context:
-        student_params = model(
+        student_output = model(
             fixed_mineral=batch["fixed_mineral"],
             moving_group=batch["moving_group"],
             group=batch["group_id"],
+            return_aux=student_requests_corr,
         )
+    student_params, student_corr_levels = unpack_branch_prediction(student_output)
 
     components = {}
     total = None
@@ -1166,7 +1552,18 @@ def compute_training_loss(a, model, batch, epoch):
             params_true=batch["params_true"],
             has_params=batch["has_params"],
             valid_overlap=student_overlap,
+            allow_empty=correspondence_enabled(a, "student"),
         )
+        if student_requests_corr:
+            student_corr_total, student_corr_components, _ = branch_correspondence_loss(
+                a,
+                student_corr_levels,
+                batch,
+                "student",
+            )
+            student_total = student_total + student_corr_total
+            student_components.update(student_corr_components)
+            student_components["total"] = student_total
         components.update(
             {f"student_{name}": value for name, value in student_components.items()}
         )
@@ -1190,18 +1587,24 @@ def compute_training_loss(a, model, batch, epoch):
         )
 
     if a.use_teacher_branch:
-        teacher_has_supervision = bool(a.param_weight and has_parameters.any())
+        teacher_requests_corr = correspondence_aux_requested(a, batch, "teacher")
+        teacher_has_supervision = bool(
+            has_parameters.any()
+            and (float(a.param_weight) > 0.0 or teacher_requests_corr)
+        )
         teacher_without_graph = a.freeze_teacher or (
             not teacher_only and a.detach_teacher and not teacher_has_supervision
         )
         teacher_context = torch.no_grad() if teacher_without_graph else nullcontext()
         with teacher_context:
-            teacher_params = model.forward_teacher(
+            teacher_output = model.forward_teacher(
                 fixed_mineral=batch["fixed_mineral"],
                 target_group=batch["target_group"],
                 moving_group=batch["moving_group"],
                 group=batch["group_id"],
+                return_aux=teacher_requests_corr,
             )
+        teacher_params, teacher_corr_levels = unpack_branch_prediction(teacher_output)
 
         if teacher_only:
             teacher_warped = warp_group_for_supervision(
@@ -1229,20 +1632,61 @@ def compute_training_loss(a, model, batch, epoch):
                 params_true=batch["params_true"],
                 has_params=batch["has_params"],
                 valid_overlap=teacher_overlap,
+                allow_empty=correspondence_enabled(a, "teacher"),
             )
+            if teacher_requests_corr:
+                (
+                    teacher_corr_total,
+                    teacher_corr_components,
+                    _,
+                ) = branch_correspondence_loss(
+                    a,
+                    teacher_corr_levels,
+                    batch,
+                    "teacher",
+                )
+                teacher_total = teacher_total + teacher_corr_total
+                teacher_components.update(teacher_corr_components)
+                teacher_components["total"] = teacher_total
             components.update(
                 {f"teacher_{name}": value for name, value in teacher_components.items()}
             )
             total = teacher_total
-        elif teacher_has_supervision:
-            teacher_param = affine_control_point_loss(
-                teacher_params[has_parameters], batch["params_true"][has_parameters]
-            )
-            teacher_total = a.param_weight * teacher_param
-            components["teacher_param"] = teacher_param
-            components["teacher_total"] = teacher_total
-            if not a.freeze_teacher:
-                total = teacher_total if total is None else total + teacher_total
+        else:
+            teacher_total = None
+            if a.param_weight and has_parameters.any():
+                teacher_param = affine_control_point_loss(
+                    teacher_params[has_parameters],
+                    batch["params_true"][has_parameters],
+                )
+                teacher_total = a.param_weight * teacher_param
+                components["teacher_param"] = teacher_param
+            if teacher_requests_corr:
+                (
+                    teacher_corr_total,
+                    teacher_corr_components,
+                    _,
+                ) = branch_correspondence_loss(
+                    a,
+                    teacher_corr_levels,
+                    batch,
+                    "teacher",
+                )
+                teacher_total = (
+                    teacher_corr_total
+                    if teacher_total is None
+                    else teacher_total + teacher_corr_total
+                )
+                components.update(
+                    {
+                        f"teacher_{name}": value
+                        for name, value in teacher_corr_components.items()
+                    }
+                )
+            if teacher_total is not None:
+                components["teacher_total"] = teacher_total
+                if not a.freeze_teacher:
+                    total = teacher_total if total is None else total + teacher_total
 
         if has_parameters.any():
             teacher_affine_metrics = affine_error_metrics(
@@ -1272,7 +1716,8 @@ def compute_training_loss(a, model, batch, epoch):
     if total is None or not total.requires_grad:
         raise RuntimeError(
             "This training phase has no differentiable objective. Configure at "
-            "least one applicable image, parameter, or regularization loss."
+            "least one applicable image, parameter, regularization, "
+            "correspondence, or distillation loss."
         )
     components["total"] = total
     return total, components, student_params
@@ -1346,6 +1791,7 @@ def save_validation_overlays(
 
 
 def main(a):
+    resolve_encoder_args(a)
     validate_args(a)
     preprocess_config = build_preprocess_config(a)
     set_seed(a.seed)
@@ -1410,7 +1856,15 @@ def main(a):
             max_rotation_degrees=a.max_rotation_deg,
             encoder_base_channels=a.encoder_base_channels,
             encoder_depth=a.encoder_depth,
+            encoder_arch=a.encoder_arch,
+            encoder_channels=tuple(a.encoder_channels),
+            encoder_blocks_per_stage=(
+                None
+                if a.encoder_blocks_per_stage is None
+                else tuple(a.encoder_blocks_per_stage)
+            ),
             feature_width=a.feature_width,
+            correlation_feature_width=a.correlation_feature_width,
             cost_hidden_channels=a.cost_hidden_channels,
             cost_volume_radii=tuple(a.cost_volume_radii),
             cost_pool_size=a.cost_pool_size,
@@ -1510,6 +1964,7 @@ def main(a):
                 if (
                     name in AFFINE_ERROR_COMPONENT_NAMES
                     or name.endswith("_param")
+                    or "_corr_" in name
                     or (name == "teacher_total" and training_phase == "student")
                 ):
                     metric_count = labeled_count
@@ -1550,10 +2005,14 @@ def main(a):
             "train_teacher_param",
             "train_teacher_total",
             "train_teacher_distill",
+            "train_student_corr_total",
+            "train_teacher_corr_total",
             "val_student_total",
             "val_student_param",
+            "val_student_corr_total",
             "val_teacher_total",
             "val_teacher_param",
+            "val_teacher_corr_total",
         }
         print(
             " ".join(

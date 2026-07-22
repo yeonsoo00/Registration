@@ -32,22 +32,33 @@ from debug_teacher import (
     signal_union_mae,
 )
 from inference import ARCHITECTURE, load_student_checkpoint
-from losses import affine_control_point_loss
+from losses import (
+    affine_control_point_loss,
+    cost_volume_correspondence_loss,
+    cost_volume_correspondence_targets,
+)
 from models import (
     AFFINE_HEAD_MODES,
     AffineHead,
     CorrelationVolumeAffineRegistrationModel,
+    DEFAULT_CORRELATION_FEATURE_WIDTH,
     DEFAULT_GROUP_SLOTS,
+    DEFAULT_RESIDUAL_BLOCKS_PER_STAGE,
+    DEFAULT_RESIDUAL_ENCODER_CHANNELS,
+    ENCODER_ARCHES,
     FeaturePyramidEncoder,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
     LocalCorrelationVolume,
     OnlineStructuralFrontend,
+    ResidualEncoderBlock,
+    ResidualEncoderStage,
     SeparatedAffineHead,
     SeparatedResidualAffineHead,
     STRUCTURAL_DESCRIPTOR_VERSION,
     TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
+    canonicalize_model_config,
     coarse_similarity_from_cost_stats,
     compose_similarity_and_residual_affine,
 )
@@ -125,7 +136,11 @@ def build_config(
         "max_rotation_degrees": 20.0,
         "encoder_base_channels": 8,
         "encoder_depth": 3,
+        "encoder_arch": "current",
+        "encoder_channels": (8, 8, 16),
+        "encoder_blocks_per_stage": None,
         "feature_width": 8,
+        "correlation_feature_width": 8,
         "cost_hidden_channels": 8,
         "cost_volume_radii": (1,),
         "cost_pool_size": 1,
@@ -507,23 +522,29 @@ def assert_frontend_forward_matrix(
             "fixed_mineral",
             "moving_group",
             "group",
+            "return_aux",
         )
         assert tuple(inspect.signature(wrapper.student.forward).parameters) == (
             "fixed_mineral",
             "moving_group",
             "group",
+            "return_aux",
+            "_batch_aux_metadata",
         )
         assert tuple(inspect.signature(wrapper.teacher.forward).parameters) == (
             "fixed_mineral",
             "target_group",
             "moving_group",
             "group",
+            "return_aux",
+            "_batch_aux_metadata",
         )
         assert tuple(inspect.signature(wrapper.forward_teacher).parameters) == (
             "fixed_mineral",
             "target_group",
             "moving_group",
             "group",
+            "return_aux",
         )
         wrapper.eval()
         with torch.no_grad():
@@ -1121,6 +1142,8 @@ def assert_model_contract(model, device, height: int, width: int) -> None:
         "fixed_mineral",
         "moving_group",
         "group",
+        "return_aux",
+        "_batch_aux_metadata",
     )
     assert all(
         parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -1369,7 +1392,7 @@ def assert_teacher_student_contract(
             batch["group_id"],
             batch["target_group"],
         )
-    except TypeError:
+    except (TypeError, RuntimeError, ValueError):
         pass
     else:
         raise AssertionError("Deployable student accepted target_group")
@@ -3119,6 +3142,578 @@ def assert_audit_metric_helpers() -> None:
     )
 
 
+def _small_residual_config() -> dict:
+    config = build_config()
+    config.update(
+        {
+            "encoder_arch": "residual",
+            "encoder_channels": (8, 16, 24),
+            "encoder_blocks_per_stage": (2,),
+            "correlation_feature_width": 12,
+        }
+    )
+    return config
+
+
+def assert_residual_encoder_and_cli_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    assert ENCODER_ARCHES == ("current", "residual")
+    assert DEFAULT_RESIDUAL_ENCODER_CHANNELS == (64, 96, 128, 192, 256)
+    assert DEFAULT_RESIDUAL_BLOCKS_PER_STAGE == (2, 2, 2, 2, 2)
+    assert DEFAULT_CORRELATION_FEATURE_WIDTH == 96
+
+    defaults = _parse_train_cli()
+    assert defaults.encoder_arch == "current"
+    assert defaults.encoder_channels is None
+    assert defaults.encoder_blocks_per_stage is None
+    assert defaults.correlation_feature_width is None
+    train_module.resolve_encoder_args(defaults)
+    assert defaults.encoder_channels == (24, 32, 48, 64, 96)
+    assert defaults.encoder_blocks_per_stage is None
+    assert defaults.correlation_feature_width == 96
+
+    residual_defaults = _parse_train_cli("--encoder_arch", "residual")
+    train_module.resolve_encoder_args(residual_defaults)
+    assert residual_defaults.encoder_channels == DEFAULT_RESIDUAL_ENCODER_CHANNELS
+    assert (
+        residual_defaults.encoder_blocks_per_stage == DEFAULT_RESIDUAL_BLOCKS_PER_STAGE
+    )
+    assert residual_defaults.correlation_feature_width == 96
+
+    custom = _parse_train_cli(
+        "--encoder_arch",
+        "residual",
+        "--encoder_channels",
+        "8",
+        "16",
+        "24",
+        "--encoder_blocks_per_stage",
+        "3",
+        "--correlation_feature_width",
+        "12",
+    )
+    train_module.resolve_encoder_args(custom)
+    assert custom.encoder_channels == (8, 16, 24)
+    assert custom.encoder_blocks_per_stage == (3, 3, 3)
+    assert custom.encoder_depth == 3
+    assert custom.correlation_feature_width == 12
+
+    legacy = canonicalize_model_config(
+        {"encoder_base_channels": 8, "encoder_depth": 3, "feature_width": 8}
+    )
+    assert legacy["encoder_arch"] == "current"
+    assert legacy["encoder_channels"] == (8, 8, 16)
+    assert legacy["encoder_blocks_per_stage"] is None
+    assert legacy["correlation_feature_width"] == 8
+
+    residual = TeacherStudentAffineRegistrationModel(
+        student_config=_small_residual_config(), use_teacher_branch=True
+    ).to(device)
+    current = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=False
+    ).to(device)
+    assert residual.teacher is not None
+    assert residual.student.encoder_channels == (8, 16, 24)
+    assert residual.student.encoder_blocks_per_stage == (2, 2, 2)
+    assert residual.student.correlation_feature_width == 12
+    assert sum(parameter.numel() for parameter in residual.student.parameters()) > sum(
+        parameter.numel() for parameter in current.student.parameters()
+    )
+    student_encoder = residual.student.encoder.shared_encoder
+    teacher_encoder = residual.teacher.encoder.shared_encoder
+    assert student_encoder is not teacher_encoder
+    assert residual.student.state_dict().keys() == residual.teacher.state_dict().keys()
+    assert all(
+        isinstance(stage, ResidualEncoderStage) for stage in student_encoder.stages
+    )
+    for stage in student_encoder.stages:
+        assert len(stage.blocks) == 2
+        for block_index, block in enumerate(stage.blocks):
+            assert isinstance(block, ResidualEncoderBlock)
+            assert isinstance(block.norm1, torch.nn.GroupNorm)
+            assert isinstance(block.norm2, torch.nn.GroupNorm)
+            if block_index == 0:
+                assert isinstance(block.projection, torch.nn.Conv2d)
+                assert block.projection.kernel_size == (1, 1)
+                assert block.projection.stride == (2, 2)
+
+    encoded = student_encoder(
+        torch.rand(2, residual.student.frontend_channels, height, width, device=device)
+    )
+    assert len(encoded) == 1
+    assert encoded[0].shape == (
+        2,
+        build_config()["feature_width"],
+        math.ceil(height / 8),
+        math.ceil(width / 8),
+    )
+    projection = residual.student.encoder.correlation_projections[0]
+    assert isinstance(projection, torch.nn.Conv2d)
+    assert projection.weight.shape == (12, 8, 1, 1)
+
+
+def assert_cost_volume_aux_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    fixed, moving, target, group = _frontend_inputs(device, height, width)
+    model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    model.eval()
+    with torch.no_grad():
+        params = model(fixed, moving, group)
+        student_aux = model(fixed, moving, group, return_aux=True)
+        teacher_aux = model.forward_teacher(
+            fixed, target, moving, group, return_aux=True
+        )
+    assert isinstance(params, torch.Tensor) and params.shape == (1, 5)
+    assert isinstance(student_aux, dict) and isinstance(teacher_aux, dict)
+    assert torch.equal(params, student_aux["params"])
+    required = {
+        "volume",
+        "probability",
+        "expected_displacement",
+        "confidence",
+        "certainty",
+        "displacements",
+        "fixed_valid",
+        "moving_valid",
+        "feature_size",
+    }
+    for output in (student_aux, teacher_aux):
+        assert output["params"].shape == (1, 5)
+        assert len(output["levels"]) == len(build_config()["cost_volume_radii"])
+        for level in output["levels"]:
+            assert required <= set(level)
+            volume = level["volume"]
+            probability = level["probability"]
+            expected = level["expected_displacement"]
+            confidence = level["confidence"]
+            certainty = level["certainty"]
+            displacements = level["displacements"]
+            fixed_valid = level["fixed_valid"]
+            moving_valid = level["moving_valid"]
+            assert volume.shape == probability.shape
+            batch_size, candidates, level_height, level_width = volume.shape
+            assert expected.shape == (batch_size, 2, level_height, level_width)
+            assert (
+                confidence.shape
+                == certainty.shape
+                == (batch_size, 1, level_height, level_width)
+            )
+            assert displacements.shape == (candidates, 2)
+            assert (
+                fixed_valid.shape
+                == moving_valid.shape
+                == (batch_size, 1, level_height, level_width)
+            )
+            assert level["feature_size"] == [level_height, level_width]
+            assert all(
+                torch.isfinite(value).all()
+                for value in (volume, probability, expected, confidence, certainty)
+            )
+            candidate_valid = level["candidate_valid"]
+            probability_sum = probability.sum(dim=1)
+            has_candidate = candidate_valid.any(dim=1)
+            assert torch.allclose(
+                probability_sum[has_candidate],
+                torch.ones_like(probability_sum[has_candidate]),
+                atol=1e-6,
+            )
+            assert torch.equal(
+                probability_sum[~has_candidate],
+                torch.zeros_like(probability_sum[~has_candidate]),
+            )
+
+
+def _correspondence_level(
+    batch_size: int, height: int, width: int, radius: int = 1
+) -> tuple[dict[str, object], tuple[torch.Tensor, ...]]:
+    displacements = LocalCorrelationVolume(
+        radius=radius, temperature=0.07
+    ).displacements.clone()
+    candidates = displacements.shape[0]
+    logits = torch.zeros(batch_size, candidates, height, width, requires_grad=True)
+    probability = torch.softmax(logits, dim=1)
+    expected = torch.zeros(batch_size, 2, height, width, requires_grad=True)
+    confidence = torch.full((batch_size, 1, height, width), 0.7, requires_grad=True)
+    validity = torch.ones(batch_size, 1, height, width, dtype=torch.bool)
+    level: dict[str, object] = {
+        "volume": torch.zeros_like(probability),
+        "probability": probability,
+        "expected_displacement": expected,
+        "confidence": confidence,
+        "certainty": torch.ones_like(confidence),
+        "displacements": displacements,
+        "fixed_valid": validity,
+        "moving_valid": validity.clone(),
+        "feature_size": [height, width],
+    }
+    return level, (logits, expected, confidence)
+
+
+def assert_correspondence_geometry_and_empty_contract() -> None:
+    height = width = 7
+    center = (height // 2, width // 2)
+    identity_level, _ = _correspondence_level(1, height, width)
+    identity_params = torch.tensor(((0.0, 0.0, 0.0, 1.0, 1.0),))
+    identity_targets = cost_volume_correspondence_targets(
+        identity_level, identity_params, torch.tensor((True,)), sigma=0.75
+    )
+    assert torch.equal(
+        identity_targets["true_displacement"][0, :, center[0], center[1]],
+        torch.zeros(2),
+    )
+    assert bool(identity_targets["in_radius_mask"][0, 0, center[0], center[1]])
+    identity_peak = int(
+        identity_targets["target_probability"][0, :, center[0], center[1]].argmax()
+    )
+    assert torch.equal(
+        identity_level["displacements"][identity_peak], torch.tensor((0.0, 0.0))
+    )
+
+    mixed_level, _ = _correspondence_level(2, height, width)
+    plus_one_x = 2.0 / (width - 1)
+    mixed_params = torch.tensor(
+        (
+            (plus_one_x, 0.0, 0.0, 1.0, 1.0),
+            (float("nan"),) * 5,
+        )
+    )
+    mixed_targets = cost_volume_correspondence_targets(
+        mixed_level, mixed_params, torch.tensor((True, False)), sigma=0.75
+    )
+    assert torch.allclose(
+        mixed_targets["true_displacement"][0, :, center[0], center[1]],
+        torch.tensor((1.0, 0.0)),
+        atol=1e-6,
+    )
+    assert not bool(mixed_targets["geometric_mask"][1].any())
+    plus_one_peak = int(
+        mixed_targets["target_probability"][0, :, center[0], center[1]].argmax()
+    )
+    assert torch.equal(
+        mixed_level["displacements"][plus_one_peak], torch.tensor((1.0, 0.0))
+    )
+
+    outside_level, _ = _correspondence_level(1, height, width, radius=1)
+    outside_params = torch.tensor(((4.0 / (width - 1), 0.0, 0.0, 1.0, 1.0),))
+    outside_targets = cost_volume_correspondence_targets(
+        outside_level, outside_params, torch.tensor((True,)), sigma=1.0
+    )
+    confidence_mask = outside_targets["confidence_mask"]
+    assert bool(confidence_mask.any())
+    assert not bool(outside_targets["in_radius_mask"].any())
+    assert torch.equal(
+        outside_targets["confidence_target"][confidence_mask],
+        torch.zeros_like(outside_targets["confidence_target"][confidence_mask]),
+    )
+    outside_losses, outside_counts = cost_volume_correspondence_loss(
+        [outside_level], outside_params, torch.tensor((True,)), sigma=1.0
+    )
+    assert outside_counts["displacement"] == 0
+    assert outside_counts["distribution"] == 0
+    assert outside_counts["confidence"] > 0
+    assert all(torch.isfinite(value) for value in outside_losses.values())
+
+    real_level, leaves = _correspondence_level(1, height, width)
+    real_losses, real_counts = cost_volume_correspondence_loss(
+        [real_level],
+        torch.full((1, 5), float("nan")),
+        torch.tensor((False,)),
+        sigma=1.0,
+    )
+    assert real_counts["synthetic_samples"] == 0
+    assert all(
+        count == 0
+        for count in (
+            real_counts["displacement"],
+            real_counts["distribution"],
+            real_counts["confidence"],
+        )
+    )
+    real_total = torch.stack(tuple(real_losses.values())).sum()
+    assert torch.isfinite(real_total) and float(real_total) == 0.0
+    real_total.backward()
+    for leaf in leaves:
+        assert leaf.grad is not None and torch.isfinite(leaf.grad).all()
+
+    empty_losses, empty_counts = cost_volume_correspondence_loss(
+        [],
+        torch.full((1, 5), float("nan")),
+        torch.tensor((False,)),
+        sigma=1.0,
+    )
+    empty_total = torch.stack(tuple(empty_losses.values())).sum()
+    assert empty_counts["levels"] == 0
+    assert torch.isfinite(empty_total) and empty_total.requires_grad
+    empty_total.backward()
+
+
+def assert_correspondence_autocast_contract(device: torch.device) -> None:
+    """Confidence supervision must remain valid inside CPU/CUDA autocast."""
+    level, _ = _correspondence_level(1, 7, 7)
+    moved_level: dict[str, object] = {}
+    for name, value in level.items():
+        if not torch.is_tensor(value):
+            moved_level[name] = value
+            continue
+        moved = value.detach().to(device)
+        if value.requires_grad:
+            moved.requires_grad_(True)
+        moved_level[name] = moved
+
+    params_true = torch.tensor(((0.0, 0.0, 0.0, 1.0, 1.0),), device=device)
+    has_params = torch.tensor((True,), dtype=torch.bool, device=device)
+    autocast_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+        losses, counts = cost_volume_correspondence_loss(
+            [moved_level], params_true, has_params, sigma=1.0
+        )
+        total = torch.stack(tuple(losses.values())).sum()
+    assert counts["confidence"] > 0
+    assert torch.isfinite(total)
+    total.backward()
+    confidence = moved_level["confidence"]
+    assert isinstance(confidence, torch.Tensor)
+    assert confidence.grad is not None and torch.isfinite(confidence.grad).all()
+
+
+def _has_nonzero_finite_gradient(module: torch.nn.Module) -> bool:
+    gradients = [
+        parameter.grad
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    ]
+    return (
+        bool(gradients)
+        and all(torch.isfinite(gradient).all() for gradient in gradients)
+        and any(bool(torch.count_nonzero(gradient)) for gradient in gradients)
+    )
+
+
+def assert_student_teacher_correspondence_gradient_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    fixed, moving, target, group = _frontend_inputs(device, height, width)
+    model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    params_true = torch.tensor(((0.0, 0.0, 0.0, 1.0, 1.0),), device=device)
+    has_params = torch.tensor((True,), dtype=torch.bool, device=device)
+
+    model.zero_grad(set_to_none=True)
+    student_aux = model(fixed, moving, group, return_aux=True)
+    student_losses, student_counts = cost_volume_correspondence_loss(
+        student_aux["levels"], params_true, has_params, sigma=1.0
+    )
+    assert student_counts["synthetic_samples"] == 1
+    torch.stack(tuple(student_losses.values())).sum().backward()
+    assert _has_nonzero_finite_gradient(model.student.encoder)
+
+    model.zero_grad(set_to_none=True)
+    teacher_aux = model.forward_teacher(fixed, target, moving, group, return_aux=True)
+    teacher_losses, teacher_counts = cost_volume_correspondence_loss(
+        teacher_aux["levels"], params_true, has_params, sigma=1.0
+    )
+    assert teacher_counts["synthetic_samples"] == 1
+    torch.stack(tuple(teacher_losses.values())).sum().backward()
+    assert model.teacher is not None
+    assert _has_nonzero_finite_gradient(model.teacher.encoder)
+
+
+def assert_training_correspondence_phase_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    args = _teacher_loss_args(detach_teacher=True, warmup_epochs=0)
+    args.corr_displacement_weight = 1.0
+    args.corr_distribution_weight = 1.0
+    args.corr_confidence_weight = 1.0
+    args.corr_target_sigma = 1.0
+    args.student_corr_weight = 1.0
+    args.teacher_corr_weight = 0.5
+
+    batch = _teacher_batch(device, height, width)
+    batch["moving_group"] = batch["target_group"].clone()
+    batch["params_true"] = batch["moving_group"].new_tensor(
+        ((0.0, 0.0, 0.0, 1.0, 1.0),)
+    )
+    batch["has_params"] = torch.tensor((True,), dtype=torch.bool, device=device)
+
+    model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    assert configure_training_phase(args, model, epoch=1) == "student"
+    model.zero_grad(set_to_none=True)
+    total, components, _ = compute_training_loss(args, model, batch, epoch=1)
+    student_corr_names = {
+        "student_corr_displacement",
+        "student_corr_distribution",
+        "student_corr_confidence",
+        "student_corr_total",
+    }
+    teacher_corr_names = {
+        "teacher_corr_displacement",
+        "teacher_corr_distribution",
+        "teacher_corr_confidence",
+        "teacher_corr_total",
+    }
+    assert student_corr_names | teacher_corr_names <= set(components)
+    assert torch.isfinite(total)
+    total.backward()
+    assert _gradient_sum(model.student) > 0.0
+    assert model.teacher is not None and _gradient_sum(model.teacher) > 0.0
+
+    warmup_args = _teacher_loss_args(detach_teacher=True, warmup_epochs=1)
+    for name in (
+        "corr_displacement_weight",
+        "corr_distribution_weight",
+        "corr_confidence_weight",
+        "corr_target_sigma",
+        "student_corr_weight",
+        "teacher_corr_weight",
+    ):
+        setattr(warmup_args, name, getattr(args, name))
+    warmup_model = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(), use_teacher_branch=True
+    ).to(device)
+    assert (
+        configure_training_phase(warmup_args, warmup_model, epoch=1) == "teacher_warmup"
+    )
+    warmup_model.zero_grad(set_to_none=True)
+    warmup_total, warmup_components, _ = compute_training_loss(
+        warmup_args, warmup_model, batch, epoch=1
+    )
+    assert teacher_corr_names <= set(warmup_components)
+    assert student_corr_names.isdisjoint(warmup_components)
+    assert torch.isfinite(warmup_total)
+    warmup_total.backward()
+    assert _gradient_sum(warmup_model.student) == 0.0
+    assert warmup_model.teacher is not None
+    assert _gradient_sum(warmup_model.teacher) > 0.0
+
+    real_batch = _teacher_batch(device, height, width)
+    assert torch.isnan(real_batch["params_true"]).all()
+    assert not bool(real_batch["has_params"].any())
+    assert configure_training_phase(args, model, epoch=1) == "student"
+    model.zero_grad(set_to_none=True)
+    real_total, real_components, _ = compute_training_loss(
+        args, model, real_batch, epoch=1
+    )
+    assert "student_charbonnier" in real_components
+    assert not any("_corr_" in name for name in real_components)
+    assert torch.isfinite(real_total)
+    real_total.backward()
+    assert _gradient_sum(model.student) > 0.0
+
+
+def _checkpoint_preprocess(height: int, width: int) -> dict:
+    return {
+        "input_contract_version": "fixed_mineral_moving_group_raw_v1",
+        "input_value_range": [0.0, 1.0],
+        "height": height,
+        "width": width,
+        "image_mode": "rgb",
+        "sfo_mode": "rgb",
+        "crop_mode": "full",
+        "crop_margin": 4,
+        "include_group1": False,
+    }
+
+
+def assert_legacy_encoder_checkpoint_migration_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    current_config = build_config()
+    preprocess = _checkpoint_preprocess(height, width)
+    source = TeacherStudentAffineRegistrationModel(
+        student_config=current_config, use_teacher_branch=False
+    ).to(device)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        save_checkpoint_pair(
+            output_dir=str(root),
+            checkpoint_name="current.pt",
+            full_payload={
+                "architecture": ARCHITECTURE,
+                "epoch": 1,
+                "metrics": {"val_student_total": 0.5},
+                "preprocess_config": preprocess,
+            },
+            model=source,
+            student_model_config=current_config,
+            preprocess_config=preprocess,
+        )
+        checkpoint = torch.load(
+            root / "current.pt", map_location="cpu", weights_only=False
+        )
+        legacy = dict(checkpoint)
+        legacy["student_model_config"] = dict(checkpoint["student_model_config"])
+        legacy["model_config"] = dict(checkpoint["model_config"])
+        encoder_keys = (
+            "encoder_arch",
+            "encoder_channels",
+            "encoder_blocks_per_stage",
+            "correlation_feature_width",
+        )
+        for key in encoder_keys:
+            legacy["student_model_config"].pop(key, None)
+            legacy["model_config"].pop(key, None)
+        nested = legacy["model_config"].get("student_config")
+        if nested is not None:
+            legacy["model_config"]["student_config"] = dict(nested)
+            for key in encoder_keys:
+                legacy["model_config"]["student_config"].pop(key, None)
+        legacy_path = root / "legacy_current.pt"
+        torch.save(legacy, legacy_path)
+
+        strict_current = TeacherStudentAffineRegistrationModel(
+            student_config=current_config, use_teacher_branch=False
+        ).to(device)
+        load_initial_weights(
+            strict_current,
+            str(legacy_path),
+            device,
+            expected_student_model_config=current_config,
+            expected_preprocess_config=preprocess,
+            expected_use_teacher_branch=False,
+        )
+        assert all(
+            torch.equal(value, strict_current.student.state_dict()[name])
+            for name, value in source.student.state_dict().items()
+        )
+
+        residual_config = _small_residual_config()
+        migrated = TeacherStudentAffineRegistrationModel(
+            student_config=residual_config, use_teacher_branch=False
+        ).to(device)
+        with mock.patch("builtins.print") as printed:
+            load_initial_weights(
+                migrated,
+                str(legacy_path),
+                device,
+                expected_student_model_config=residual_config,
+                expected_preprocess_config=preprocess,
+                expected_use_teacher_branch=False,
+            )
+        report = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in printed.call_args_list
+        )
+        assert "current -> residual" in report
+        assert "newly initialized destination keys" in report
+        assert "shape-mismatched checkpoint keys" in report
+        assert torch.equal(
+            migrated.student.group_embedding.weight,
+            source.student.group_embedding.weight,
+        )
+        residual_weight = (
+            migrated.student.encoder.shared_encoder.stages[0].blocks[0].conv1.weight
+        )
+        assert torch.isfinite(residual_weight).all()
+
+
 def main(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -3132,6 +3727,15 @@ def main(args: argparse.Namespace) -> None:
     assert_full_source_supervision_contract(device, args.height, args.width)
     assert_audit_metric_helpers()
     assert_frontend_cli_contract()
+    assert_residual_encoder_and_cli_contract(device, args.height, args.width)
+    assert_cost_volume_aux_contract(device, args.height, args.width)
+    assert_correspondence_geometry_and_empty_contract()
+    assert_correspondence_autocast_contract(device)
+    assert_student_teacher_correspondence_gradient_contract(
+        device, args.height, args.width
+    )
+    assert_training_correspondence_phase_contract(device, args.height, args.width)
+    assert_legacy_encoder_checkpoint_migration_contract(device, args.height, args.width)
     assert_teacher_phase_cli_and_validation_contract()
     assert_affine_head_geometry_contract(device)
     assert_coarse_affine_and_composition_contract(device)

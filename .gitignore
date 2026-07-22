@@ -3,3 +3,4 @@ ckpt/
 wandb/
 Results/
 Debug/
+Inference/

@@ -24,6 +24,7 @@ from dataset import MAX_GROUP_STAINS, CartilageDataset
 from models import (
     AFFINE_HEAD_MODES,
     DEFAULT_GROUP_SLOTS,
+    ENCODER_ARCHES,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
     CorrelationVolumeAffineRegistrationModel,
@@ -284,6 +285,10 @@ def main(a):
     pre, cfg, state = load_student_checkpoint(a.checkpoint)
     required_base_config = {
         "affine_head_mode",
+        "encoder_arch",
+        "encoder_channels",
+        "encoder_blocks_per_stage",
+        "correlation_feature_width",
         "input_channels",
         "frontend_mode",
         "group_input_mode",
@@ -296,6 +301,34 @@ def main(a):
             "Deployable checkpoint is missing student_model_config fields: "
             + ", ".join(missing_base_config)
         )
+    encoder_arch = cfg["encoder_arch"]
+    if encoder_arch not in ENCODER_ARCHES:
+        raise ValueError(
+            f"Unsupported encoder_arch {encoder_arch!r}; expected one of "
+            + ", ".join(ENCODER_ARCHES)
+        )
+    encoder_channels = tuple(cfg["encoder_channels"])
+    if len(encoder_channels) < 3 or any(channel < 1 for channel in encoder_channels):
+        raise ValueError(
+            "Checkpoint encoder_channels must contain positive stage widths"
+        )
+    encoder_blocks = cfg["encoder_blocks_per_stage"]
+    if encoder_arch == "residual":
+        if encoder_blocks is None or len(tuple(encoder_blocks)) != len(
+            encoder_channels
+        ):
+            raise ValueError(
+                "Residual checkpoint must store one block count per encoder stage"
+            )
+        if any(block < 1 for block in encoder_blocks):
+            raise ValueError("Residual checkpoint block counts must be positive")
+    elif encoder_blocks is not None:
+        raise ValueError(
+            "Current encoder checkpoint must not contain residual block counts"
+        )
+    if cfg["correlation_feature_width"] < 1:
+        raise ValueError("Checkpoint correlation_feature_width must be positive")
+
     frontend_mode = cfg["frontend_mode"]
     if frontend_mode not in FRONTEND_MODES:
         raise ValueError(

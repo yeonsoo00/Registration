@@ -46,8 +46,28 @@ MAX_STRUCTURAL_RADIUS = 32
 FRONTEND_MODES = ("structural", "raw", "hybrid")
 GROUP_INPUT_MODES = ("stack", "overlay")
 AFFINE_HEAD_MODES = ("joint", "separated", "separated_residual")
+ENCODER_ARCHES = ("current", "residual")
+DEFAULT_RESIDUAL_ENCODER_CHANNELS = (64, 96, 128, 192, 256)
+DEFAULT_RESIDUAL_BLOCKS_PER_STAGE = (2, 2, 2, 2, 2)
+DEFAULT_CORRELATION_FEATURE_WIDTH = 96
 DEFAULT_GROUP_SLOTS = 3
 TEACHER_FIXED_INPUT_VERSION = "mineral_target_validity_mean_v1"
+
+
+def _positive_int_tuple(values: int | Sequence[int], name: str) -> tuple[int, ...]:
+    """Normalize one-or-more positive integer configuration values."""
+    if isinstance(values, bool):
+        raise ValueError(f"{name} must contain positive integers")
+    if isinstance(values, int):
+        parsed = (values,)
+    else:
+        parsed = tuple(values)
+    if not parsed or any(
+        isinstance(value, bool) or int(value) != value or int(value) < 1
+        for value in parsed
+    ):
+        raise ValueError(f"{name} must contain positive integers")
+    return tuple(int(value) for value in parsed)
 
 
 def canonicalize_model_config(config: dict | None) -> dict:
@@ -65,6 +85,71 @@ def canonicalize_model_config(config: dict | None) -> dict:
     # Checkpoints written before geometry-head ablations used AffineHead. Keep
     # that exact module/state-dict interpretation when the field is absent.
     canonical.setdefault("affine_head_mode", "joint")
+
+    # Encoder fields were added after the original CNN/FPN checkpoints. Missing
+    # fields must reconstruct that exact architecture: in particular, an old
+    # checkpoint must not gain a learned correlation projection merely because
+    # the default for new command-line runs is wider.
+    encoder_arch = str(canonical.setdefault("encoder_arch", "current"))
+    if encoder_arch not in ENCODER_ARCHES:
+        choices = ", ".join(ENCODER_ARCHES)
+        raise ValueError(f"encoder_arch must be one of: {choices}")
+
+    configured_channels = canonical.get("encoder_channels")
+    if configured_channels is None:
+        if encoder_arch == "residual":
+            channels = DEFAULT_RESIDUAL_ENCODER_CHANNELS
+        else:
+            channels = tuple(
+                _stage_channels(
+                    int(canonical.get("encoder_base_channels", 24)),
+                    int(canonical.get("encoder_depth", 5)),
+                )
+            )
+    else:
+        channels = _positive_int_tuple(configured_channels, "encoder_channels")
+    if len(channels) < 3:
+        raise ValueError("encoder_channels must contain at least three stages")
+    canonical["encoder_channels"] = tuple(channels)
+    canonical["encoder_depth"] = len(channels)
+
+    configured_blocks = canonical.get("encoder_blocks_per_stage")
+    if configured_blocks is None:
+        blocks = (
+            (
+                DEFAULT_RESIDUAL_BLOCKS_PER_STAGE
+                if tuple(channels) == DEFAULT_RESIDUAL_ENCODER_CHANNELS
+                else tuple(2 for _ in channels)
+            )
+            if encoder_arch == "residual"
+            else None
+        )
+    else:
+        parsed_blocks = _positive_int_tuple(
+            configured_blocks, "encoder_blocks_per_stage"
+        )
+        if len(parsed_blocks) == 1:
+            blocks = parsed_blocks * len(channels)
+        elif len(parsed_blocks) == len(channels):
+            blocks = parsed_blocks
+        else:
+            raise ValueError(
+                "encoder_blocks_per_stage must contain one value or exactly one "
+                "value per encoder stage"
+            )
+    canonical["encoder_blocks_per_stage"] = blocks
+
+    correlation_width = canonical.get("correlation_feature_width")
+    if correlation_width is None:
+        # Legacy cost volumes correlated the FPN features directly.
+        correlation_width = int(canonical.get("feature_width", 48))
+    if (
+        isinstance(correlation_width, bool)
+        or int(correlation_width) != correlation_width
+        or int(correlation_width) < 1
+    ):
+        raise ValueError("correlation_feature_width must be a positive integer")
+    canonical["correlation_feature_width"] = int(correlation_width)
     return canonical
 
 
@@ -495,8 +580,73 @@ class ConvStage(nn.Module):
         return self.activation(feature + self.refine(feature))
 
 
+class ResidualEncoderBlock(nn.Module):
+    """Two-convolution residual block with GroupNorm and a learned skip."""
+
+    def __init__(self, in_channels: int, out_channels: int, *, stride: int = 1) -> None:
+        super().__init__()
+        if stride not in (1, 2):
+            raise ValueError("ResidualEncoderBlock stride must be 1 or 2")
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.norm1 = _make_norm(out_channels, "group")
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.norm2 = _make_norm(out_channels, "group")
+        self.projection = (
+            nn.Identity()
+            if stride == 1 and in_channels == out_channels
+            else nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False)
+        )
+        self.activation = nn.GELU()
+
+        for module in (self.conv1, self.conv2, self.projection):
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        # The residual branch begins as zero while the learned projection still
+        # carries channel changes and downsampling. This is the appropriate
+        # identity initialization for same-shape blocks.
+        nn.init.zeros_(self.norm2.weight)
+        nn.init.zeros_(self.norm2.bias)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        residual = self.projection(image)
+        feature = self.activation(self.norm1(self.conv1(image)))
+        feature = self.norm2(self.conv2(feature))
+        return self.activation(residual + feature)
+
+
+class ResidualEncoderStage(nn.Module):
+    """Stride-two residual stage followed by same-resolution refinements."""
+
+    def __init__(self, in_channels: int, out_channels: int, blocks: int) -> None:
+        super().__init__()
+        if blocks < 1:
+            raise ValueError("Every residual encoder stage needs at least one block")
+        modules = [ResidualEncoderBlock(in_channels, out_channels, stride=2)]
+        modules.extend(
+            ResidualEncoderBlock(out_channels, out_channels) for _ in range(blocks - 1)
+        )
+        self.blocks = nn.ModuleList(modules)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        feature = image
+        for block in self.blocks:
+            feature = block(feature)
+        return feature
+
+
 class FeaturePyramidEncoder(nn.Module):
-    """Weight-shared CNN encoder with top-down FPN fusion."""
+    """Weight-shared selectable CNN encoder with top-down FPN fusion."""
 
     def __init__(
         self,
@@ -506,27 +656,77 @@ class FeaturePyramidEncoder(nn.Module):
         feature_width: int,
         norm_type: str,
         num_cost_levels: int,
+        encoder_arch: str = "current",
+        encoder_channels: Sequence[int] | None = None,
+        encoder_blocks_per_stage: int | Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         if feature_width < 8:
             raise ValueError("feature_width must be at least 8")
         if num_cost_levels < 1:
             raise ValueError("At least one cost-volume level is required")
-        if encoder_depth < num_cost_levels + 2:
+        if encoder_arch not in ENCODER_ARCHES:
+            choices = ", ".join(ENCODER_ARCHES)
+            raise ValueError(f"encoder_arch must be one of: {choices}")
+
+        if encoder_channels is None:
+            channels = (
+                DEFAULT_RESIDUAL_ENCODER_CHANNELS
+                if encoder_arch == "residual"
+                else tuple(_stage_channels(encoder_base_channels, encoder_depth))
+            )
+        else:
+            channels = _positive_int_tuple(encoder_channels, "encoder_channels")
+        if len(channels) < num_cost_levels + 2:
             raise ValueError(
-                "encoder_depth must be at least len(cost_volume_radii) + 2 so "
-                "the finest cost volume is no finer than 1/8"
+                "The encoder must have at least len(cost_volume_radii) + 2 "
+                "stages so the finest cost volume is no finer than 1/8"
             )
 
-        channels = _stage_channels(encoder_base_channels, encoder_depth)
+        block_counts: tuple[int, ...] | None
+        if encoder_blocks_per_stage is None:
+            block_counts = (
+                (
+                    DEFAULT_RESIDUAL_BLOCKS_PER_STAGE
+                    if tuple(channels) == DEFAULT_RESIDUAL_ENCODER_CHANNELS
+                    else tuple(2 for _ in channels)
+                )
+                if encoder_arch == "residual"
+                else None
+            )
+        else:
+            parsed_blocks = _positive_int_tuple(
+                encoder_blocks_per_stage, "encoder_blocks_per_stage"
+            )
+            if len(parsed_blocks) == 1:
+                block_counts = parsed_blocks * len(channels)
+            elif len(parsed_blocks) == len(channels):
+                block_counts = parsed_blocks
+            else:
+                raise ValueError(
+                    "encoder_blocks_per_stage must contain one value or exactly "
+                    "one value per encoder stage"
+                )
+
+        self.encoder_arch = encoder_arch
+        self.encoder_channels = tuple(channels)
+        self.encoder_blocks_per_stage = block_counts
         stages = []
         in_channels = input_channels
-        for out_channels in channels:
-            stages.append(ConvStage(in_channels, out_channels, norm_type))
+        for index, out_channels in enumerate(channels):
+            if encoder_arch == "current":
+                stage = ConvStage(in_channels, out_channels, norm_type)
+            else:
+                assert block_counts is not None
+                stage = ResidualEncoderStage(
+                    in_channels, out_channels, block_counts[index]
+                )
+            stages.append(stage)
             in_channels = out_channels
         self.stages = nn.ModuleList(stages)
-        # Stages 0 and 1 are needed by the bottom-up encoder but must not have
-        # high-resolution FPN convolutions because matching begins at stage 2.
+
+        # Stages 0 and 1 remain bottom-up only. Matching always begins at stage
+        # 2 (1/8), irrespective of channel widths or residual block counts.
         fpn_indices = range(2, len(channels))
         self.lateral = nn.ModuleDict(
             {
@@ -534,17 +734,27 @@ class FeaturePyramidEncoder(nn.Module):
                 for index in fpn_indices
             }
         )
+        fpn_norm_type = "group" if encoder_arch == "residual" else norm_type
         self.smooth = nn.ModuleDict(
             {
                 str(index): nn.Sequential(
                     nn.Conv2d(feature_width, feature_width, 3, padding=1, bias=False),
-                    _make_norm(feature_width, norm_type),
+                    _make_norm(feature_width, fpn_norm_type),
                     nn.GELU(),
                 )
                 for index in range(2, len(channels))
             }
         )
-        # Stage index 0 is 1/2, index 1 is 1/4, and index 2 is 1/8.
+        if encoder_arch == "residual":
+            for collection in (self.lateral, self.smooth):
+                for module in collection.modules():
+                    if isinstance(module, nn.Conv2d):
+                        nn.init.kaiming_normal_(
+                            module.weight, mode="fan_out", nonlinearity="relu"
+                        )
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+
         self.cost_indices = tuple(range(2, 2 + num_cost_levels))
         self.min_cost_index = self.cost_indices[0]
 
@@ -559,9 +769,6 @@ class FeaturePyramidEncoder(nn.Module):
         last_index = len(bottom_up) - 1
         top_down = self.lateral[str(last_index)](bottom_up[-1])
         pyramid[-1] = self.smooth[str(last_index)](top_down)
-        # Do not construct discarded 1/2 or 1/4 FPN maps. At 1024 pixels those
-        # high-resolution 3x3 convolutions are expensive and cannot contribute
-        # to a cost volume because the finest matching level is fixed at 1/8.
         for index in range(len(bottom_up) - 2, self.min_cost_index - 1, -1):
             lateral = self.lateral[str(index)](bottom_up[index])
             top_down = lateral + F.interpolate(
@@ -649,7 +856,18 @@ class LocalCorrelationVolume(nn.Module):
         moving: torch.Tensor,
         fixed_valid: torch.Tensor | None = None,
         moving_valid: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            dict[str, object],
+        ]
+    ):
         if fixed.shape != moving.shape:
             raise ValueError(
                 f"Correlation feature mismatch: {tuple(fixed.shape)} vs "
@@ -710,7 +928,9 @@ class LocalCorrelationVolume(nn.Module):
         displacement_table = self.displacements.to(
             device=volume.device, dtype=volume.dtype
         )
-        expected = torch.einsum("bkhw,kd->bdhw", probability, displacement_table)
+        probability_expected = torch.einsum(
+            "bkhw,kd->bdhw", probability, displacement_table
+        )
         confidence = probability.amax(dim=1, keepdim=True)
         entropy = -(probability * torch.log(probability.clamp_min(1e-8))).sum(
             dim=1, keepdim=True
@@ -727,8 +947,42 @@ class LocalCorrelationVolume(nn.Module):
         # A uniform distribution over asymmetric valid border offsets has a
         # non-zero raw displacement. Certainty gating prevents that geometry
         # artefact from becoming a false correspondence.
-        expected = expected * certainty
-        return volume, expected, confidence, certainty
+        expected = probability_expected * certainty
+        if not return_aux:
+            return volume, expected, confidence, certainty
+
+        if _batch_aux_metadata:
+            # nn.DataParallel gathers tensors along their leading dimension.
+            # Repeat non-batched metadata temporarily; the outer wrapper turns
+            # it back into the canonical Kx2 table and [height, width] list.
+            aux_displacements: torch.Tensor = displacement_table.unsqueeze(0).expand(
+                batch_size, -1, -1
+            )
+            aux_feature_size: object = (
+                torch.tensor((height, width), device=volume.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+        else:
+            aux_displacements = displacement_table
+            aux_feature_size = [height, width]
+        auxiliary: dict[str, object] = {
+            "volume": raw_volume,
+            "probability": probability,
+            "expected_displacement": probability_expected,
+            "confidence": confidence,
+            "certainty": certainty,
+            "displacements": aux_displacements,
+            "fixed_valid": fixed_valid,
+            "moving_valid": moving_valid,
+            "feature_size": aux_feature_size,
+            # Training needs the per-candidate border/evidence support when it
+            # normalizes a Gaussian correspondence target. The requested public
+            # fields remain present verbatim; this extra mask prevents callers
+            # from reverse-engineering validity from floating probabilities.
+            "candidate_valid": valid_volume,
+        }
+        return volume, expected, confidence, certainty, auxiliary
 
 
 class CostVolumeAggregator(nn.Module):
@@ -862,6 +1116,10 @@ class CorrelationVolumePairEncoder(nn.Module):
         correlation_temperature: float,
         norm_type: str,
         require_input_evidence: bool = True,
+        encoder_arch: str = "current",
+        encoder_channels: Sequence[int] | None = None,
+        encoder_blocks_per_stage: int | Sequence[int] | None = None,
+        correlation_feature_width: int = DEFAULT_CORRELATION_FEATURE_WIDTH,
     ) -> None:
         super().__init__()
         if structural_channels < 1:
@@ -869,10 +1127,12 @@ class CorrelationVolumePairEncoder(nn.Module):
         radii = tuple(int(radius) for radius in cost_volume_radii)
         if not radii:
             raise ValueError("cost_volume_radii cannot be empty")
-        if encoder_depth < len(radii) + 2:
-            raise ValueError(
-                "encoder_depth must be at least len(cost_volume_radii) + 2"
-            )
+        if (
+            isinstance(correlation_feature_width, bool)
+            or int(correlation_feature_width) != correlation_feature_width
+            or int(correlation_feature_width) < 1
+        ):
+            raise ValueError("correlation_feature_width must be a positive integer")
         self.cost_volume_radii = radii
         self.structural_channels = int(structural_channels)
         self.require_input_evidence = bool(require_input_evidence)
@@ -883,7 +1143,28 @@ class CorrelationVolumePairEncoder(nn.Module):
             feature_width=feature_width,
             norm_type=norm_type,
             num_cost_levels=len(radii),
+            encoder_arch=encoder_arch,
+            encoder_channels=encoder_channels,
+            encoder_blocks_per_stage=encoder_blocks_per_stage,
         )
+        self.correlation_feature_width = int(correlation_feature_width)
+        if self.correlation_feature_width == feature_width:
+            self.correlation_projections = nn.ModuleList(nn.Identity() for _ in radii)
+        else:
+            projections = [
+                nn.Conv2d(
+                    feature_width,
+                    self.correlation_feature_width,
+                    1,
+                    bias=False,
+                )
+                for _ in radii
+            ]
+            for projection in projections:
+                nn.init.kaiming_normal_(
+                    projection.weight, mode="fan_out", nonlinearity="relu"
+                )
+            self.correlation_projections = nn.ModuleList(projections)
         self.correlations = nn.ModuleList(
             [
                 LocalCorrelationVolume(radius, correlation_temperature)
@@ -932,7 +1213,9 @@ class CorrelationVolumePairEncoder(nn.Module):
         group_structure_valid: torch.Tensor | None = None,
         fixed_structure_valid: torch.Tensor | None = None,
         return_displacement_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, object]:
         if group_structure.ndim != 4 or fixed_structure.ndim != 4:
             raise ValueError("Structural descriptors must be BCHW tensors")
         if group_structure.shape != fixed_structure.shape:
@@ -1008,11 +1291,13 @@ class CorrelationVolumePairEncoder(nn.Module):
         )
         descriptors = []
         displacement_stats = []
+        levels: list[dict[str, object]] = []
         for (
             group_feature,
             fixed_feature,
             group_valid,
             fixed_valid,
+            projection,
             correlation,
             aggregator,
         ) in zip(
@@ -1020,25 +1305,51 @@ class CorrelationVolumePairEncoder(nn.Module):
             fixed_pyramid,
             group_valid_pyramid,
             fixed_valid_pyramid,
+            self.correlation_projections,
             self.correlations,
             self.aggregators,
         ):
+            # The one projection module is shared between both Siamese sides.
+            # Joint projection also keeps any future stateful projection layer
+            # independent of fixed/moving call order.
+            projected = projection(torch.cat((group_feature, fixed_feature), dim=0))
+            group_feature = projected[:batch_size]
+            fixed_feature = projected[batch_size:]
             if group_valid is not None:
                 group_feature = group_feature * group_valid.to(group_feature.dtype)
             if fixed_valid is not None:
                 fixed_feature = fixed_feature * fixed_valid.to(fixed_feature.dtype)
-            volume, displacement, confidence, certainty = correlation(
+            correlation_output = correlation(
                 fixed_feature,
                 group_feature,
                 fixed_valid=fixed_valid,
                 moving_valid=group_valid,
+                return_aux=return_aux,
+                _batch_aux_metadata=_batch_aux_metadata,
             )
+            if return_aux:
+                (
+                    volume,
+                    displacement,
+                    confidence,
+                    certainty,
+                    level_aux,
+                ) = correlation_output
+                levels.append(level_aux)
+            else:
+                volume, displacement, confidence, certainty = correlation_output
             descriptor, stats = aggregator(volume, displacement, confidence, certainty)
             descriptors.extend((descriptor, stats))
             displacement_stats.append(stats)
         latent = self.fusion(torch.cat(descriptors, dim=1))
+        stacked_stats = torch.stack(displacement_stats, dim=1)
+        if return_aux:
+            auxiliary: dict[str, object] = {"levels": levels}
+            if return_displacement_stats:
+                auxiliary["displacement_stats"] = stacked_stats
+            return latent, auxiliary
         if return_displacement_stats:
-            return latent, torch.stack(displacement_stats, dim=1)
+            return latent, stacked_stats
         return latent
 
 
@@ -1378,7 +1689,11 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         max_rotation_degrees: float = 20.0,
         encoder_base_channels: int = 24,
         encoder_depth: int = 5,
+        encoder_arch: str = "current",
+        encoder_channels: Sequence[int] | None = None,
+        encoder_blocks_per_stage: int | Sequence[int] | None = None,
         feature_width: int = 48,
+        correlation_feature_width: int = DEFAULT_CORRELATION_FEATURE_WIDTH,
         cost_hidden_channels: int = 48,
         cost_volume_radii: Sequence[int] = (4, 4, 4),
         cost_pool_size: int = 4,
@@ -1407,6 +1722,9 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         if affine_head_mode not in AFFINE_HEAD_MODES:
             choices = ", ".join(AFFINE_HEAD_MODES)
             raise ValueError(f"affine_head_mode must be one of: {choices}")
+        if encoder_arch not in ENCODER_ARCHES:
+            choices = ", ".join(ENCODER_ARCHES)
+            raise ValueError(f"encoder_arch must be one of: {choices}")
         if (
             isinstance(group_slots, bool)
             or int(group_slots) != group_slots
@@ -1443,6 +1761,7 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         self.use_group_embedding = bool(use_group_embedding)
         self.force_group1_identity = bool(force_group1_identity)
         self.affine_head_mode = affine_head_mode
+        self.encoder_arch = encoder_arch
         self.scale_range = tuple(map(float, scale_range))
         self.translation_limit = float(translation_limit)
         self.max_rotation_degrees = float(max_rotation_degrees)
@@ -1500,6 +1819,10 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             encoder_base_channels=encoder_base_channels,
             encoder_depth=encoder_depth,
             feature_width=feature_width,
+            encoder_arch=encoder_arch,
+            encoder_channels=encoder_channels,
+            encoder_blocks_per_stage=encoder_blocks_per_stage,
+            correlation_feature_width=correlation_feature_width,
             cost_hidden_channels=cost_hidden_channels,
             cost_volume_radii=cost_volume_radii,
             cost_pool_size=cost_pool_size,
@@ -1507,6 +1830,11 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             norm_type=norm_type,
             require_input_evidence=self.frontend_mode == "structural",
         )
+        self.encoder_channels = self.encoder.shared_encoder.encoder_channels
+        self.encoder_blocks_per_stage = (
+            self.encoder.shared_encoder.encoder_blocks_per_stage
+        )
+        self.correlation_feature_width = self.encoder.correlation_feature_width
         if self.use_group_embedding:
             self.group_embedding = nn.Embedding(
                 self.num_groups + 1, group_embedding_dim
@@ -1736,7 +2064,9 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         moving_valid: torch.Tensor,
         group_ids: torch.Tensor,
         adapt_fixed_group: bool,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         if self.frontend_mode == "structural":
             # Keep the original pre-adapter descriptor-evidence gate verbatim.
             moving_valid = _validity_with_structural_evidence(
@@ -1775,14 +2105,32 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
                     fixed_representation.dtype
                 )
 
-        if self.affine_head_mode == "separated_residual":
-            latent, cost_stats = self.encoder(
-                moving_representation,
-                fixed_representation,
-                group_structure_valid=moving_valid,
-                fixed_structure_valid=fixed_valid,
-                return_displacement_stats=True,
-            )
+        needs_displacement_stats = self.affine_head_mode == "separated_residual"
+        encoder_result = self.encoder(
+            moving_representation,
+            fixed_representation,
+            group_structure_valid=moving_valid,
+            fixed_structure_valid=fixed_valid,
+            return_displacement_stats=needs_displacement_stats,
+            return_aux=return_aux,
+            _batch_aux_metadata=_batch_aux_metadata,
+        )
+        encoder_aux: dict[str, object] | None = None
+        if return_aux:
+            latent, encoder_aux_value = encoder_result
+            if not isinstance(encoder_aux_value, dict):
+                raise AssertionError("Encoder auxiliary result must be a dictionary")
+            encoder_aux = encoder_aux_value
+            cost_stats = encoder_aux.get("displacement_stats")
+        elif needs_displacement_stats:
+            latent, cost_stats = encoder_result
+        else:
+            latent = encoder_result
+            cost_stats = None
+
+        if needs_displacement_stats:
+            if not isinstance(cost_stats, torch.Tensor):
+                raise AssertionError("Separated-residual mode requires cost statistics")
             coarse_params = coarse_similarity_from_cost_stats(
                 cost_stats,
                 self.scale_range,
@@ -1790,12 +2138,6 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
                 self.max_rotation_degrees,
             )
         else:
-            latent = self.encoder(
-                moving_representation,
-                fixed_representation,
-                group_structure_valid=moving_valid,
-                fixed_structure_valid=fixed_valid,
-            )
             coarse_params = None
         if self.group_embedding is not None:
             latent = torch.cat((latent, self.group_embedding(group_ids)), dim=1)
@@ -1816,14 +2158,24 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         force_identity = ~has_pair_evidence
         if self.force_group1_identity:
             force_identity = force_identity | (group_ids == 1)
-        return torch.where(force_identity[:, None], identity[None, :], params)
+        final_params = torch.where(force_identity[:, None], identity[None, :], params)
+        if not return_aux:
+            return final_params
+        if encoder_aux is None:
+            raise AssertionError("return_aux=True requires encoder auxiliary output")
+        levels = encoder_aux.get("levels")
+        if not isinstance(levels, list):
+            raise AssertionError("Encoder auxiliary output is missing levels")
+        return {"params": final_params, "levels": levels}
 
     def forward(
         self,
         fixed_mineral: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         """Predict the deployable student affine without registered targets."""
         batch_size, _, channels, height, width = self._validate_group_stack(
             moving_group, "moving_group"
@@ -1850,6 +2202,8 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             moving_valid=moving_valid,
             group_ids=group_ids,
             adapt_fixed_group=False,
+            return_aux=return_aux,
+            _batch_aux_metadata=_batch_aux_metadata,
         )
 
     def fuse_teacher_fixed_representations(
@@ -1922,7 +2276,9 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         """Predict from Mineral, registered targets, and the moving group.
 
         This method is training-only. It is intentionally not called by the
@@ -1961,6 +2317,8 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             moving_valid=moving_valid,
             group_ids=group_ids,
             adapt_fixed_group=True,
+            return_aux=return_aux,
+            _batch_aux_metadata=_batch_aux_metadata,
         )
 
 
@@ -1979,13 +2337,60 @@ class GroupPairCorrelationVolumeAffineRegistrationModel(
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+        _batch_aux_metadata: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         return self.forward_group_pair(
             fixed_mineral,
             target_group,
             moving_group,
             group,
+            return_aux=return_aux,
+            _batch_aux_metadata=_batch_aux_metadata,
         )
+
+
+def _canonicalize_auxiliary_metadata(
+    output: torch.Tensor | dict[str, object],
+) -> torch.Tensor | dict[str, object]:
+    """Undo batch-shaped metadata used for safe ``nn.DataParallel`` gather."""
+    if not isinstance(output, dict):
+        return output
+    levels = output.get("levels")
+    if not isinstance(levels, list):
+        raise ValueError("Auxiliary branch output must contain a levels list")
+    canonical_levels: list[dict[str, object]] = []
+    for level in levels:
+        if not isinstance(level, dict):
+            raise ValueError("Every auxiliary correlation level must be a dictionary")
+        canonical = dict(level)
+        displacements = canonical.get("displacements")
+        if isinstance(displacements, torch.Tensor) and displacements.ndim == 3:
+            if displacements.shape[0] < 1 or not torch.equal(
+                displacements, displacements[:1].expand_as(displacements)
+            ):
+                raise ValueError(
+                    "DataParallel displacement metadata differs across samples"
+                )
+            canonical["displacements"] = displacements[0]
+        feature_size = canonical.get("feature_size")
+        if isinstance(feature_size, torch.Tensor):
+            if feature_size.ndim != 2 or feature_size.shape[1] != 2:
+                raise ValueError("Batched feature_size metadata must have shape Bx2")
+            if feature_size.shape[0] < 1 or not torch.equal(
+                feature_size, feature_size[:1].expand_as(feature_size)
+            ):
+                raise ValueError(
+                    "DataParallel feature sizes differ across branch replicas"
+                )
+            canonical["feature_size"] = [
+                int(feature_size[0, 0]),
+                int(feature_size[0, 1]),
+            ]
+        canonical_levels.append(canonical)
+    result = dict(output)
+    result["levels"] = canonical_levels
+    return result
 
 
 class TeacherStudentAffineRegistrationModel(nn.Module):
@@ -2027,9 +2432,20 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
         fixed_mineral: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         """Run only the deployable student path."""
-        return self.student(fixed_mineral, moving_group, group)
+        if not return_aux:
+            return self.student(fixed_mineral, moving_group, group)
+        batch_metadata = isinstance(self.student, nn.DataParallel)
+        output = self.student(
+            fixed_mineral,
+            moving_group,
+            group,
+            return_aux=True,
+            _batch_aux_metadata=batch_metadata,
+        )
+        return _canonicalize_auxiliary_metadata(output)
 
     def forward_teacher(
         self,
@@ -2037,13 +2453,25 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
         target_group: torch.Tensor,
         moving_group: torch.Tensor,
         group: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ) -> torch.Tensor | dict[str, object]:
         """Run the training-only Mineral + same-group teacher path."""
         if self.teacher is None:
             raise RuntimeError(
                 "Teacher branch is disabled; construct with use_teacher_branch=True"
             )
-        return self.teacher(fixed_mineral, target_group, moving_group, group)
+        if not return_aux:
+            return self.teacher(fixed_mineral, target_group, moving_group, group)
+        batch_metadata = isinstance(self.teacher, nn.DataParallel)
+        output = self.teacher(
+            fixed_mineral,
+            target_group,
+            moving_group,
+            group,
+            return_aux=True,
+            _batch_aux_metadata=batch_metadata,
+        )
+        return _canonicalize_auxiliary_metadata(output)
 
 
 # A short compatibility alias keeps external scripts that expect the original
@@ -2053,6 +2481,10 @@ GroupAffineRegistrationModel = CorrelationVolumeAffineRegistrationModel
 
 __all__ = [
     "AFFINE_HEAD_MODES",
+    "DEFAULT_CORRELATION_FEATURE_WIDTH",
+    "DEFAULT_RESIDUAL_BLOCKS_PER_STAGE",
+    "DEFAULT_RESIDUAL_ENCODER_CHANNELS",
+    "ENCODER_ARCHES",
     "AffineHead",
     "CorrelationVolumeAffineRegistrationModel",
     "DEFAULT_GROUP_SLOTS",
@@ -2065,6 +2497,8 @@ __all__ = [
     "GroupAffineRegistrationModel",
     "LocalCorrelationVolume",
     "OnlineStructuralFrontend",
+    "ResidualEncoderBlock",
+    "ResidualEncoderStage",
     "SeparatedAffineHead",
     "SeparatedResidualAffineHead",
     "STRUCTURAL_CHANNEL_NAMES",
