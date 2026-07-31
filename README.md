@@ -159,8 +159,8 @@ L_corr_b = b_corr_weight * (
 `--corr_target_sigma` is measured in feature pixels and defaults to `1.0`.
 `--student_corr_weight` and `--teacher_corr_weight` default to `1.0` and allow
 one branch to be ablated without changing the component weights. All three
-component weights default to zero, preserving old training. Synthetic samples
-supervise student and teacher independently; during teacher-only warmup only
+component weights default to zero. 
+Synthetic samples supervise student and teacher independently. During teacher-only warmup only
 the teacher term updates, while the normal phase can apply both branch terms.
 
 
@@ -185,37 +185,13 @@ signal-support masks remove padded slots and newly exposed affine borders. The
 image objective can combine multiscale local NCC, gradient NCC, Charbonnier
 distance, multiscale gradient loss, and soft foreground Dice.
 
-`params_true` exists only for synthetic rows (`has_params=True`). Real rows
-store an explicit NaN sentinel with `has_params=False`; they are never assigned
-an identity target. A shared runtime mask validates that every labeled row has
-a finite target and selects only those rows for control-point supervision.
-Outside warmup, distillation also uses control-point affine error:
-
-```text
-L_normal = L_student_image(all rows)
-  + param_weight * CP(student_params[has_params], params_true[has_params])
-  + optional param_weight * CP(teacher_params[has_params], params_true[has_params])
-  + active_distill_weight * CP(student_params, teacher_params)
-  + L_corr_student + optional L_corr_teacher
-  + reg_weight * R(student_params[~has_params])
-
-L_teacher_warmup = L_teacher_image(all rows)
-  + param_weight * CP(teacher_params[has_params], params_true[has_params])
-  + L_corr_teacher
-  + reg_weight * R(teacher_params[~has_params])
-```
 
 `L_teacher_image` uses the same NCC, edge, Charbonnier, gradient, overlap, and
 valid-FOV machinery as the student image objective. Empty labeled or unlabeled
 subsets are skipped, so `synthetic_prob` may be anywhere in `[0, 1]` and
 `param_weight` may be zero.
 
-`CP` applies both affine transforms to the four normalized image corners and
-the center, then uses Smooth L1 error. This compares spatial displacement
-instead of directly mixing translation, radians, and scale units.
-
-For synthetic Stage 1, image supervision, validation images, and final
-overlays avoid applying a second interpolating warp to an already transformed
+For synthetic Stage 1, image supervision and validation images avoid applying a second interpolating warp to an already transformed
 and clipped tensor. Let `target_group` be the registered source before the
 synthetic augmentation and let:
 
@@ -227,16 +203,6 @@ A_final = A_syn @ A_pred
 corrected_full = warp(target_group, A_final)
 ```
 
-The matrix order follows PyTorch `affine_grid`/`grid_sample`, whose affine maps
-output coordinates to input coordinates. Thus `corrected_full` is the one-pass
-equivalent of `corrected_sequential`, but samples from the pre-augmentation
-registered tensor and avoids compounded interpolation and clipping. Synthetic
-image losses and quantitative validation use `corrected_full`. Saved validation
-overlays intentionally use the deployable sequential path
-`warp_model_space_group(synthetic_moving, A_pred)`, so they reproduce standalone
-inference instead of displaying the supervision-only full-source shortcut. The
-full-source supervision tensor is the original normalized **model-space** tensor: it remains HSV for an HSV-configured
-stain rather than being converted to display RGB before warping.
 
 Real Stage 2 has no known synthetic affine or pre-augmentation registered
 source for the moving observation, so its behavior is unchanged:
@@ -283,13 +249,9 @@ python train.py \
 ## Stage 2: real-data teacher adaptation and fine-tuning
 
 Stage 2 may mix real unregistered rows with synthetic rows. Each training item
-is synthetic with probability `synthetic_prob`; otherwise it uses the real
+is synthetic with probability `synthetic_prob`. Otherwise it uses the real
 unregistered stain as `moving_group`, its registered counterpart as
-`target_group`, `has_params=False`, and an undefined `params_true`. During a
-nonzero teacher warmup, both kinds contribute image losses, only synthetic rows
-contribute control-point supervision, and only real rows contribute affine
-regularization. Validation can remain fully real with
-`--val_synthetic_prob 0.0`.
+`target_group`, `has_params=False`, and an undefined `params_true`.
 
 ```
 conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/train.py \
@@ -339,13 +301,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --n_workers 8 --amp
 ```
 
-For all-real teacher adaptation, keep the nonzero warmup and use
-`--synthetic_prob 0.0` with `--param_weight 0.0`; the teacher then learns
-exclusively from NCC, edge, Charbonnier, gradient, overlap, and regularization
-losses. For the earlier fixed-teacher Stage-2 behavior, use
-`--teacher_warmup_epochs 0`, `--freeze_teacher`, `--synthetic_prob 0.0`, and
-`--param_weight 0.0`. `--freeze_teacher` and nonzero teacher warmup are
-intentionally mutually exclusive.
+
 
 ## Inference (Student model only)
 
@@ -363,19 +319,4 @@ params = model(
     group=batch["group_id"],
 )
 ```
-
-`model_space_group_overlays/<index>_<sample>_G<group>.png` is produced with the
-same `_save_group_overlay()` call as validation: the same normalized
-`fixed_mineral`, warped group, `valid_group`, `group_id`, and `sfo_mode` form an
-HSV-aware screen composite. It is therefore the direct validation-style output
-to compare. Real Stage-2 and synthetic Stage-1 validation are comparable
-to inference because all visualization paths warp their actual `moving_group` once with the
-predicted affine. The composed full-source warp remains limited to training and
-quantitative supervision.
-
-Inference also writes original-resolution aligned RGB stains,
-`predicted_group_affine_parameters.csv`, and the existing max composites:
-group-only `group_overlays/<sample>/groupN_overlay.png` and Mineral-plus-group
-`group_overlays/<sample>/groupN_with_mineral_overlay.png`. These are useful
-delivery outputs, but they are not the model-space validation composite.
 
