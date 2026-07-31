@@ -1,4 +1,4 @@
-"""Losses for affine registration of pseudo-coloured histology images."""
+# Losses for affine registration of histology images.
 
 from __future__ import annotations
 
@@ -243,7 +243,7 @@ def correlation_ratio_loss(
     eps: float = 1e-8,
     weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Differentiable `1 - correlation ratio` for multimodal alignment."""
+    """Differentiable (1 - correlation) ratio for multimodal alignment."""
     b = moving.shape[0]
     y = moving.mean(dim=1).reshape(b, -1)
     x = target.mean(dim=1).reshape(b, -1)
@@ -307,7 +307,7 @@ def jaccard_distance_loss(
     weight: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Soft Jaccard distance in [0,1]; use mainly as a diagnostic."""
+    """Soft Jaccard distance in [0,1]. Use mainly as a diagnostic."""
     m = _unit_interval(moving, eps)
     t = _unit_interval(target, eps)
     w = torch.ones_like(m) if weight is None else _expand_weight(weight, m)

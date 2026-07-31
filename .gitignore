@@ -4,3 +4,9 @@ wandb/
 Results/
 Debug/
 Inference/
+
+evaluate_inference_metrics.py
+README2.md
+smoke_test.py
+debug_teacher.py
+test.ipynb

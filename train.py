@@ -39,6 +39,8 @@ from models import (
     ENCODER_ARCHES,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
+    STUDENT_FIXED_ADAPTER_MODES,
+    STUDENT_FIXED_ADAPTER_STATE_PREFIX,
     TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
     canonicalize_model_config,
@@ -214,6 +216,16 @@ def parse_args():
         "--separate_group_adapters",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    p.add_argument(
+        "--student_fixed_adapter",
+        choices=STUDENT_FIXED_ADAPTER_MODES,
+        default="none",
+        help=(
+            "Student Mineral-side adaptation: none preserves the shared fixed "
+            "representation, while separate uses an independent residual adapter "
+            "for each registration group"
+        ),
     )
     p.add_argument("--model_scale_range", type=float, nargs=2, default=[0.8, 1.2])
     p.add_argument("--translation_limit", type=float, default=0.5)
@@ -914,6 +926,7 @@ FLAT_ENCODER_CONFIG_KEYS = (
     "encoder_blocks_per_stage",
     "correlation_feature_width",
 )
+STUDENT_FIXED_ADAPTER_CONFIG_KEY = "student_fixed_adapter"
 
 
 def _config_differences(saved, expected):
@@ -934,7 +947,7 @@ def _format_config_differences(differences):
 
 
 def _checkpoint_load_mode(saved, expected):
-    """Return strict or the one explicitly supported encoder migration mode."""
+    """Return the explicit, narrowly scoped checkpoint migration mode."""
     if expected is None:
         return "strict"
     differences = _config_differences(saved, expected)
@@ -943,26 +956,52 @@ def _checkpoint_load_mode(saved, expected):
 
     saved_arch = (saved or {}).get("encoder_arch")
     expected_arch = expected.get("encoder_arch")
-    unrelated = sorted(set(differences) - ENCODER_MIGRATION_CONFIG_KEYS)
-    if saved_arch == "current" and expected_arch == "residual" and not unrelated:
-        print("Checkpoint encoder migration explicitly enabled: current -> residual")
-        print("Changed encoder settings:")
-        for key, (saved_value, expected_value) in differences.items():
-            print(f"  {key}: {saved_value!r} -> {expected_value!r}")
-        return "current_to_residual"
+    saved_fixed_adapter = (saved or {}).get(STUDENT_FIXED_ADAPTER_CONFIG_KEY, "none")
+    expected_fixed_adapter = expected.get(STUDENT_FIXED_ADAPTER_CONFIG_KEY, "none")
+    encoder_migration = saved_arch == "current" and expected_arch == "residual"
+    adapter_migration = (
+        saved_fixed_adapter == "none" and expected_fixed_adapter == "separate"
+    )
 
-    details = _format_config_differences(differences)
-    if saved_arch == "current" and expected_arch == "residual" and unrelated:
+    allowed_differences = set()
+    if encoder_migration:
+        allowed_differences.update(ENCODER_MIGRATION_CONFIG_KEYS)
+    if adapter_migration:
+        allowed_differences.add(STUDENT_FIXED_ADAPTER_CONFIG_KEY)
+    unrelated = sorted(set(differences) - allowed_differences)
+    if unrelated:
+        details = _format_config_differences(differences)
         raise ValueError(
-            "Current-to-residual migration cannot change non-encoder settings: "
+            "Checkpoint migration cannot change unrelated model settings: "
             + ", ".join(unrelated)
             + ". Differences: "
             + details
         )
+
+    if encoder_migration:
+        print("Checkpoint encoder migration explicitly enabled: current -> residual")
+        print("Changed encoder settings:")
+        for key, (saved_value, expected_value) in differences.items():
+            if key in ENCODER_MIGRATION_CONFIG_KEYS:
+                print(f"  {key}: {saved_value!r} -> {expected_value!r}")
+    if adapter_migration:
+        print(
+            "Checkpoint student fixed-adapter migration explicitly enabled: "
+            "none -> separate"
+        )
+
+    if encoder_migration and adapter_migration:
+        return "current_to_residual_and_student_fixed_adapter"
+    if encoder_migration:
+        return "current_to_residual"
+    if adapter_migration:
+        return "student_fixed_adapter"
+
+    details = _format_config_differences(differences)
     raise ValueError(
         "Correlation checkpoint student_model_config differs from this run. "
-        "Only an explicit current-to-residual encoder migration is supported. "
-        "Differences: " + details
+        "Only current-to-residual encoder migration and none-to-separate student "
+        "fixed-adapter migration are supported. Differences: " + details
     )
 
 
@@ -992,7 +1031,13 @@ def _print_key_list(title, keys):
         print(f"  {key}")
 
 
-def _load_migrated_branch_state(branch, source_state, branch_name):
+def _load_migrated_branch_state(
+    branch,
+    source_state,
+    branch_name,
+    *,
+    allowed_prefixes,
+):
     """Load shape-compatible tensors and report every non-strict decision."""
     destination = _branch_module(branch)
     destination_state = destination.state_dict()
@@ -1012,10 +1057,7 @@ def _load_migrated_branch_state(branch, source_state, branch_name):
         compatible[key] = value
 
     newly_initialized_by_filter = sorted(set(destination_state) - set(compatible))
-    allowed_prefixes = (
-        "encoder.shared_encoder.",
-        "encoder.correlation_projections.",
-    )
+    allowed_prefixes = tuple(allowed_prefixes)
     unsafe_new = [
         key
         for key in newly_initialized_by_filter
@@ -1027,7 +1069,7 @@ def _load_migrated_branch_state(branch, source_state, branch_name):
     ]
     if unsafe_new or unsafe_old or unsafe_shapes:
         raise RuntimeError(
-            f"Unsafe {branch_name} checkpoint migration touched non-encoder keys: "
+            f"Unsafe {branch_name} checkpoint migration touched disallowed keys: "
             f"new={unsafe_new}, unexpected={unsafe_old}, shape_mismatch={unsafe_shapes}"
         )
 
@@ -1136,14 +1178,46 @@ def load_initial_weights(
         if saved_teacher_presence
         else None
     )
-    if checkpoint_load_mode == "current_to_residual":
-        _load_migrated_branch_state(model.student, student_state, "student")
+    encoder_migration = checkpoint_load_mode in {
+        "current_to_residual",
+        "current_to_residual_and_student_fixed_adapter",
+    }
+    adapter_migration = checkpoint_load_mode in {
+        "student_fixed_adapter",
+        "current_to_residual_and_student_fixed_adapter",
+    }
+    if encoder_migration or adapter_migration:
+        encoder_prefixes = (
+            "encoder.shared_encoder.",
+            "encoder.correlation_projections.",
+        )
+        student_allowed_prefixes = list(encoder_prefixes if encoder_migration else ())
+        if adapter_migration:
+            student_allowed_prefixes.append(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+        _load_migrated_branch_state(
+            model.student,
+            student_state,
+            "student",
+            allowed_prefixes=student_allowed_prefixes,
+        )
         if teacher_state is not None:
             if model.teacher is None:
                 raise ValueError(
                     "Checkpoint contains a teacher but this model does not"
                 )
-            _load_migrated_branch_state(model.teacher, teacher_state, "teacher")
+            if encoder_migration:
+                _load_migrated_branch_state(
+                    model.teacher,
+                    teacher_state,
+                    "teacher",
+                    allowed_prefixes=encoder_prefixes,
+                )
+            else:
+                # The new fixed-side adapters belong only to the student. An
+                # adapter-only migration must not relax teacher loading at all.
+                _branch_module(model.teacher).load_state_dict(
+                    teacher_state, strict=True
+                )
     else:
         try:
             _branch_module(model.student).load_state_dict(student_state, strict=True)
@@ -1158,7 +1232,8 @@ def load_initial_weights(
         except RuntimeError as error:
             raise RuntimeError(
                 "Teacher/student checkpoint mismatch. Strict loading is required "
-                "unless encoder_arch explicitly changes from current to residual."
+                "unless encoder_arch explicitly changes from current to residual "
+                "or student_fixed_adapter explicitly changes from none to separate."
             ) from error
     return checkpoint
 
@@ -1230,6 +1305,11 @@ def validate_args(a):
     if a.affine_head_mode not in AFFINE_HEAD_MODES:
         raise ValueError(
             f"affine_head_mode must be one of {', '.join(AFFINE_HEAD_MODES)}"
+        )
+    if a.student_fixed_adapter not in STUDENT_FIXED_ADAPTER_MODES:
+        raise ValueError(
+            "student_fixed_adapter must be one of "
+            + ", ".join(STUDENT_FIXED_ADAPTER_MODES)
         )
     if MAX_GROUP_STAINS != DEFAULT_GROUP_SLOTS:
         raise ValueError(
@@ -1436,6 +1516,7 @@ def save_checkpoint_pair(
             "frontend_mode": student_model_config["frontend_mode"],
             "group_input_mode": student_model_config["group_input_mode"],
             "affine_head_mode": student_model_config["affine_head_mode"],
+            "student_fixed_adapter": student_model_config["student_fixed_adapter"],
             "student_config": student_model_config,
             "use_teacher_branch": model.teacher is not None,
         }
@@ -1873,6 +1954,7 @@ def main(a):
             force_group1_identity=a.force_group1_identity,
             separate_group_heads=a.separate_group_heads,
             separate_group_adapters=a.separate_group_adapters,
+            student_fixed_adapter=a.student_fixed_adapter,
         )
     )
     model = TeacherStudentAffineRegistrationModel(
@@ -2036,6 +2118,7 @@ def main(a):
                 "frontend_mode": student_model_config["frontend_mode"],
                 "group_input_mode": student_model_config["group_input_mode"],
                 "affine_head_mode": student_model_config["affine_head_mode"],
+                "student_fixed_adapter": student_model_config["student_fixed_adapter"],
                 "student_config": student_model_config,
                 "use_teacher_branch": a.use_teacher_branch,
             },

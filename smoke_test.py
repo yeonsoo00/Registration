@@ -55,7 +55,10 @@ from models import (
     ResidualEncoderStage,
     SeparatedAffineHead,
     SeparatedResidualAffineHead,
+    STUDENT_FIXED_ADAPTER_MODES,
+    STUDENT_FIXED_ADAPTER_STATE_PREFIX,
     STRUCTURAL_DESCRIPTOR_VERSION,
+    StudentFixedGroupAdapter,
     TEACHER_FIXED_INPUT_VERSION,
     TeacherStudentAffineRegistrationModel,
     canonicalize_model_config,
@@ -112,6 +115,7 @@ def build_config(
     group_input_mode: str = "overlay",
     group_slots: int = MAX_GROUP_STAINS,
     affine_head_mode: str = "joint",
+    student_fixed_adapter: str = "none",
 ) -> dict:
     """Return the smallest valid v3 model used by these CPU contracts."""
     return {
@@ -149,6 +153,7 @@ def build_config(
         "force_group1_identity": True,
         "separate_group_heads": True,
         "separate_group_adapters": True,
+        "student_fixed_adapter": student_fixed_adapter,
     }
 
 
@@ -172,11 +177,17 @@ def assert_frontend_cli_contract() -> None:
     assert defaults.frontend_mode == "structural"
     assert defaults.group_input_mode == "overlay"
     assert defaults.affine_head_mode == "joint"
+    assert defaults.student_fixed_adapter == "none"
     assert defaults.freeze_teacher is False
     assert FRONTEND_MODES == ("structural", "raw", "hybrid")
     assert GROUP_INPUT_MODES == ("stack", "overlay")
     assert AFFINE_HEAD_MODES == ("joint", "separated", "separated_residual")
+    assert STUDENT_FIXED_ADAPTER_MODES == ("none", "separate")
     assert DEFAULT_GROUP_SLOTS == MAX_GROUP_STAINS
+    assert (
+        _parse_train_cli("--student_fixed_adapter", "separate").student_fixed_adapter
+        == "separate"
+    )
     custom = build_config("raw", "stack", group_slots=2)
     assert custom["frontend_mode"] == "raw"
     assert custom["group_input_mode"] == "stack"
@@ -499,6 +510,220 @@ def assert_structural_frontend_compatibility(
         legacy_params = legacy(fixed, moving, group)
         explicit_params = explicit(fixed, moving, group)
     assert torch.equal(legacy_params, explicit_params)
+
+
+def assert_student_fixed_adapter_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    """The optional fixed adapters are student-only, routed, and mask-safe."""
+    del height, width
+    old_config = build_config()
+    old_config.pop("student_fixed_adapter")
+    canonical_old = canonicalize_model_config(old_config)
+    assert canonical_old["student_fixed_adapter"] == "none"
+
+    torch.manual_seed(601)
+    legacy_default = CorrelationVolumeAffineRegistrationModel(**old_config).to(device)
+    torch.manual_seed(601)
+    explicit_none = CorrelationVolumeAffineRegistrationModel(
+        **build_config(student_fixed_adapter="none")
+    ).to(device)
+    assert isinstance(explicit_none.student_fixed_group_adapters, torch.nn.ModuleDict)
+    assert len(explicit_none.student_fixed_group_adapters) == 0
+    assert not any(
+        key.startswith(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+        for key in explicit_none.state_dict()
+    )
+    assert legacy_default.state_dict().keys() == explicit_none.state_dict().keys()
+    assert all(
+        torch.equal(value, explicit_none.state_dict()[key])
+        for key, value in legacy_default.state_dict().items()
+    )
+
+    separate = CorrelationVolumeAffineRegistrationModel(
+        **build_config(student_fixed_adapter="separate")
+    ).to(device)
+    adapters = separate.student_fixed_group_adapters
+    assert isinstance(adapters, torch.nn.ModuleDict)
+    assert tuple(adapters.keys()) == ("G2", "G3", "G4", "G5")
+    for adapter in adapters.values():
+        assert isinstance(adapter, StudentFixedGroupAdapter)
+        assert isinstance(adapter.conv1, torch.nn.Conv2d)
+        assert adapter.conv1.kernel_size == (3, 3)
+        assert adapter.conv1.padding == (1, 1)
+        assert isinstance(adapter.norm1, torch.nn.GroupNorm)
+        assert isinstance(adapter.activation1, torch.nn.GELU)
+        assert isinstance(adapter.conv2, torch.nn.Conv2d)
+        assert adapter.conv2.kernel_size == (3, 3)
+        assert adapter.conv2.padding == (1, 1)
+        assert isinstance(adapter.norm2, torch.nn.GroupNorm)
+        assert isinstance(adapter.activation2, torch.nn.GELU)
+        assert torch.count_nonzero(adapter.norm2.weight) == 0
+        assert torch.count_nonzero(adapter.norm2.bias) == 0
+        probe = torch.rand((2, separate.frontend_channels, 9, 11), device=device)
+        with torch.no_grad():
+            adapted = adapter(probe)
+        # Zero initialization makes the residual contribution exactly zero;
+        # the prescribed final GELU is the only initial deviation from identity.
+        torch.testing.assert_close(adapted, F.gelu(probe), atol=1e-7, rtol=1e-7)
+
+    assert separate.group_adapters is not None
+    fixed_parameter_ids = {
+        id(parameter)
+        for adapter in adapters.values()
+        for parameter in adapter.parameters()
+    }
+    moving_parameter_ids = {
+        id(parameter)
+        for adapter in separate.group_adapters
+        for parameter in adapter.parameters()
+    }
+    assert fixed_parameter_ids
+    assert fixed_parameter_ids.isdisjoint(moving_parameter_ids)
+    fixed_storage = {
+        parameter.untyped_storage().data_ptr()
+        for adapter in adapters.values()
+        for parameter in adapter.parameters()
+    }
+    moving_storage = {
+        parameter.untyped_storage().data_ptr()
+        for adapter in separate.group_adapters
+        for parameter in adapter.parameters()
+    }
+    assert fixed_storage.isdisjoint(moving_storage)
+
+    batch_size = 5
+    spatial_size = 32
+    channels = separate.frontend_channels
+    group_ids = torch.tensor((5, 2, 1, 4, 3), dtype=torch.long, device=device)
+    fixed_representation = torch.rand(
+        (batch_size, channels, spatial_size, spatial_size), device=device
+    )
+    moving_representation = torch.rand_like(fixed_representation)
+    fixed_valid = torch.zeros(
+        (batch_size, 1, spatial_size, spatial_size),
+        dtype=torch.bool,
+        device=device,
+    )
+    fixed_valid[:, :, 5:-6, 7:-8] = True
+    moving_valid = torch.ones_like(fixed_valid)
+    fixed_calls: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {
+        key: [] for key in adapters
+    }
+    moving_calls = {index: 0 for index in range(5)}
+    encoder_inputs: dict[str, torch.Tensor] = {}
+    handles = []
+
+    def fixed_hook(key):
+        def record(_module, inputs, output):
+            fixed_calls[key].append(
+                (inputs[0].detach().clone(), output.detach().clone())
+            )
+
+        return record
+
+    for key, adapter in adapters.items():
+        handles.append(adapter.register_forward_hook(fixed_hook(key)))
+    for index, adapter in enumerate(separate.group_adapters):
+        handles.append(
+            adapter.register_forward_hook(
+                lambda _module, _inputs, _output, index=index: moving_calls.__setitem__(
+                    index, moving_calls[index] + 1
+                )
+            )
+        )
+
+    def encoder_hook(_module, inputs, _kwargs):
+        encoder_inputs["moving"] = inputs[0].detach().clone()
+        encoder_inputs["fixed"] = inputs[1].detach().clone()
+
+    handles.append(
+        separate.encoder.register_forward_pre_hook(encoder_hook, with_kwargs=True)
+    )
+    separate.eval()
+    try:
+        with torch.no_grad():
+            params = separate._predict_from_representations(
+                fixed_representation=fixed_representation,
+                moving_representation=moving_representation,
+                fixed_valid=fixed_valid,
+                moving_valid=moving_valid,
+                group_ids=group_ids,
+                adapt_fixed_group=False,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert params.shape == (batch_size, 5)
+    assert all(count == 1 for count in moving_calls.values())
+    assert all(len(fixed_calls[key]) == 1 for key in ("G2", "G3", "G4", "G5"))
+    fixed_entering_encoder = encoder_inputs["fixed"]
+    expanded_valid = fixed_valid.expand_as(fixed_entering_encoder)
+    assert torch.count_nonzero(fixed_entering_encoder[~expanded_valid]) == 0
+    masked_fixed = fixed_representation * fixed_valid.to(fixed_representation.dtype)
+    for row, group_id in enumerate(group_ids.tolist()):
+        if group_id == 1:
+            expected = masked_fixed[row]
+        else:
+            expected = fixed_calls[f"G{group_id}"][0][1][0]
+            expected = expected * fixed_valid[row].to(expected.dtype)
+        torch.testing.assert_close(fixed_entering_encoder[row], expected)
+
+    wrapper = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(student_fixed_adapter="separate"),
+        use_teacher_branch=True,
+    ).to(device)
+    assert wrapper.teacher is not None
+    assert tuple(wrapper.student.student_fixed_group_adapters) == (
+        "G2",
+        "G3",
+        "G4",
+        "G5",
+    )
+    assert len(wrapper.teacher.student_fixed_group_adapters) == 0
+    assert not any(
+        key.startswith(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+        for key in wrapper.teacher.state_dict()
+    )
+    shared_student_state = {
+        key: value
+        for key, value in wrapper.student.state_dict().items()
+        if not key.startswith(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+    }
+    assert shared_student_state.keys() == wrapper.teacher.state_dict().keys()
+    assert all(
+        torch.equal(value, wrapper.teacher.state_dict()[key])
+        for key, value in shared_student_state.items()
+    )
+
+    baseline = TeacherStudentAffineRegistrationModel(
+        student_config=build_config(student_fixed_adapter="none"),
+        use_teacher_branch=True,
+    ).to(device)
+    assert baseline.teacher is not None
+    baseline.teacher.load_state_dict(wrapper.teacher.state_dict(), strict=True)
+    fixed, moving, target, group = _frontend_inputs(device, 32, 32)
+    teacher_adapter_calls = []
+    assert wrapper.teacher.group_adapters is not None
+    teacher_handle = wrapper.teacher.group_adapters[2].register_forward_hook(
+        lambda _module, _inputs, _output: teacher_adapter_calls.append(True)
+    )
+    wrapper.eval()
+    baseline.eval()
+    try:
+        with torch.no_grad():
+            separate_teacher_params = wrapper.forward_teacher(
+                fixed, target, moving, group
+            )
+            baseline_teacher_params = baseline.forward_teacher(
+                fixed, target, moving, group
+            )
+    finally:
+        teacher_handle.remove()
+    # Existing teacher routing applies its moving adapter to moving and fused
+    # fixed representations. The new student-only option must not alter that.
+    assert len(teacher_adapter_calls) == 2
+    torch.testing.assert_close(separate_teacher_params, baseline_teacher_params)
 
 
 def assert_frontend_forward_matrix(
@@ -3714,6 +3939,157 @@ def assert_legacy_encoder_checkpoint_migration_contract(
         assert torch.isfinite(residual_weight).all()
 
 
+def assert_student_fixed_adapter_checkpoint_contract(
+    device: torch.device, height: int, width: int
+) -> None:
+    """Legacy none checkpoints migrate only new student adapter parameters."""
+    preprocess = _checkpoint_preprocess(height, width)
+    none_config = build_config(student_fixed_adapter="none")
+    source = TeacherStudentAffineRegistrationModel(
+        student_config=none_config, use_teacher_branch=True
+    ).to(device)
+    assert source.teacher is not None
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        save_checkpoint_pair(
+            output_dir=str(root),
+            checkpoint_name="legacy_source.pt",
+            full_payload={
+                "architecture": ARCHITECTURE,
+                "epoch": 1,
+                "metrics": {"val_student_total": 0.5},
+                "preprocess_config": preprocess,
+            },
+            model=source,
+            student_model_config=none_config,
+            preprocess_config=preprocess,
+        )
+        checkpoint = torch.load(
+            root / "legacy_source.pt", map_location="cpu", weights_only=False
+        )
+        legacy = dict(checkpoint)
+        legacy["student_model_config"] = dict(checkpoint["student_model_config"])
+        legacy["model_config"] = dict(checkpoint["model_config"])
+        legacy["student_model_config"].pop("student_fixed_adapter")
+        legacy["model_config"].pop("student_fixed_adapter")
+        nested = legacy["model_config"].get("student_config")
+        assert nested is not None
+        legacy["model_config"]["student_config"] = dict(nested)
+        legacy["model_config"]["student_config"].pop("student_fixed_adapter")
+        legacy_path = root / "legacy_missing_fixed_adapter.pt"
+        torch.save(legacy, legacy_path)
+
+        loaded_preprocess, loaded_legacy_config, legacy_state = load_student_checkpoint(
+            str(legacy_path)
+        )
+        assert loaded_preprocess == preprocess
+        assert loaded_legacy_config["student_fixed_adapter"] == "none"
+        legacy_deployable = CorrelationVolumeAffineRegistrationModel(
+            **loaded_legacy_config
+        ).to(device)
+        legacy_deployable.load_state_dict(legacy_state, strict=True)
+
+        separate_config = build_config(student_fixed_adapter="separate")
+        migrated = TeacherStudentAffineRegistrationModel(
+            student_config=separate_config, use_teacher_branch=True
+        ).to(device)
+        assert migrated.teacher is not None
+        initialized_adapter_state = {
+            key: value.detach().clone()
+            for key, value in migrated.student.state_dict().items()
+            if key.startswith(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+        }
+        assert initialized_adapter_state
+        with mock.patch("builtins.print") as printed:
+            load_initial_weights(
+                migrated,
+                str(legacy_path),
+                device,
+                expected_student_model_config=separate_config,
+                expected_preprocess_config=preprocess,
+                expected_use_teacher_branch=True,
+            )
+        report = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in printed.call_args_list
+        )
+        assert "none -> separate" in report
+        assert "Checkpoint migration report for student branch" in report
+        assert "newly initialized destination keys" in report
+        assert "Checkpoint migration report for teacher branch" not in report
+        assert all(key in report for key in initialized_adapter_state)
+        assert all(
+            torch.equal(value, migrated.student.state_dict()[key])
+            for key, value in initialized_adapter_state.items()
+        )
+        assert all(
+            torch.equal(value, migrated.student.state_dict()[key])
+            for key, value in source.student.state_dict().items()
+        )
+        assert all(
+            torch.equal(value, migrated.teacher.state_dict()[key])
+            for key, value in source.teacher.state_dict().items()
+        )
+
+        save_checkpoint_pair(
+            output_dir=str(root),
+            checkpoint_name="separate.pt",
+            full_payload={
+                "architecture": ARCHITECTURE,
+                "epoch": 2,
+                "metrics": {"val_student_total": 0.4},
+                "preprocess_config": preprocess,
+            },
+            model=migrated,
+            student_model_config=separate_config,
+            preprocess_config=preprocess,
+        )
+        full = torch.load(root / "separate.pt", map_location="cpu", weights_only=False)
+        deployable = torch.load(
+            root / "separate_student.pt", map_location="cpu", weights_only=False
+        )
+        for saved in (full, deployable):
+            assert saved["student_model_config"]["student_fixed_adapter"] == "separate"
+            assert saved["model_config"]["student_fixed_adapter"] == "separate"
+
+        fixed, moving, _, group = _frontend_inputs(device, height, width)
+        reference_params = None
+        for path in (root / "separate.pt", root / "separate_student.pt"):
+            loaded_preprocess, loaded_config, loaded_state = load_student_checkpoint(
+                str(path)
+            )
+            assert loaded_preprocess == preprocess
+            assert loaded_config["student_fixed_adapter"] == "separate"
+            inference_student = CorrelationVolumeAffineRegistrationModel(
+                **loaded_config
+            ).to(device)
+            inference_student.load_state_dict(loaded_state, strict=True)
+            inference_student.eval()
+            with torch.no_grad():
+                params = inference_student(fixed, moving, group)
+            if reference_params is None:
+                reference_params = params
+            else:
+                torch.testing.assert_close(params, reference_params)
+
+        rejected = TeacherStudentAffineRegistrationModel(
+            student_config=none_config, use_teacher_branch=True
+        ).to(device)
+        try:
+            load_initial_weights(
+                rejected,
+                str(root / "separate.pt"),
+                device,
+                expected_student_model_config=none_config,
+                expected_preprocess_config=preprocess,
+                expected_use_teacher_branch=True,
+            )
+        except ValueError as error:
+            assert "student_fixed_adapter" in str(error)
+        else:
+            raise AssertionError("Checkpoint loading silently dropped fixed adapters")
+
+
 def main(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -3736,10 +4112,12 @@ def main(args: argparse.Namespace) -> None:
     )
     assert_training_correspondence_phase_contract(device, args.height, args.width)
     assert_legacy_encoder_checkpoint_migration_contract(device, args.height, args.width)
+    assert_student_fixed_adapter_checkpoint_contract(device, args.height, args.width)
     assert_teacher_phase_cli_and_validation_contract()
     assert_affine_head_geometry_contract(device)
     assert_coarse_affine_and_composition_contract(device)
     assert_structural_frontend_compatibility(device, args.height, args.width)
+    assert_student_fixed_adapter_contract(device, args.height, args.width)
     assert_frontend_forward_matrix(device, args.height, args.width)
     assert_teacher_mineral_fusion_contract(device, args.height, args.width)
     assert_raw_and_hybrid_frontend_contract(device, args.height, args.width)

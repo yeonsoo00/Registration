@@ -1,14 +1,13 @@
-"""Dataset for deployable stain-group affine registration.
+# Dataset for group affine registration.
 
-Each item contains a fixed Mineral image, one padded stack of unregistered moving
-stains, and (when explicitly required) the matching registered stain stack used
-only as supervision. Missing group members are zero-filled. Consequently one
-model prediction can be shared by every valid stain acquired in that group.
+# Each item contains a fixed Mineral image, one padded stack of unregistered moving
+# stains. Missing group members are zero-filled. Consequently one
+# model prediction can be shared by every valid stain acquired in that group.
 
-Images remain raw float32 values in [0, 1] after the common geometric
-preprocessing. Structural conversion belongs to the model, so prediction
-never depends on a registered target-group image.
-"""
+# Images remain raw float32 values in [0, 1] after the common geometric
+# preprocessing. Structural conversion belongs to the model, so prediction
+# never depends on a registered target-group image.
+
 
 from __future__ import annotations
 
@@ -101,17 +100,6 @@ def _convert_sfo(image_rgb: np.ndarray, mode: str) -> np.ndarray:
 
 
 class CartilageDataset(Dataset):
-    """Return one fixed-size stack for each sample/acquisition group.
-
-    When require_registered_targets is true, only matching moving/target stain
-    pairs are valid for real samples. Synthetic samples use a registered target
-    as their source and therefore do not require an unregistered file. When it
-    is false, item discovery and validity depend only on fixed Mineral and
-    unregistered moving stains; target slots are returned as zeros and
-    target-group files are never decoded. fixed_mineral_root defaults to
-    registered_root for training compatibility, but inference may point it at
-    the deployment input root independently of optional evaluation targets.
-    """
 
     def __init__(
         self,

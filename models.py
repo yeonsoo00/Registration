@@ -1,11 +1,8 @@
-"""Deployable correlation-volume model with selectable image frontends.
+"""Correlation-volume model with selectable image frontends.
 
-The deployable student consumes registered Mineral and unregistered grouped
-stains through a structural, raw, or concatenated hybrid frontend. Registered
-target stains never enter the student or inference path. An optional independent
-training-only teacher compares the moving group against a validity-aware fusion
-of registered Mineral and the registered version of the same group. Within each branch, learnable domain adapters (when needed) feed
-one weight-shared CNN/FPN, so both sides of every cost volume occupy the same
+The student consumes Mineral reference and unregistered grouped
+stains through a structural, raw, or concatenated hybrid frontend. Within each branch, learnable domain adapters feed
+one weight-shared FPN, so both sides of every cost volume occupy the same
 feature space. At every selected pyramid level, the model builds an explicit
 local cost volume
 
@@ -17,8 +14,7 @@ direction used by :func:`torch.nn.functional.affine_grid` and by ``utils.py``.
 
 The finest cost level is 1/8 resolution by construction.  Correlations are
 computed with a displacement loop, so the largest temporary/output volume is
-``B x (2r+1)^2 x H/8 x W/8`` rather than an all-pairs or unfolded tensor.  This
-keeps the model practical for 1024x1024 structural maps.
+``B x (2r+1)^2 x H/8 x W/8`` rather than an all-pairs or unfolded tensor.
 """
 
 from __future__ import annotations
@@ -47,6 +43,8 @@ FRONTEND_MODES = ("structural", "raw", "hybrid")
 GROUP_INPUT_MODES = ("stack", "overlay")
 AFFINE_HEAD_MODES = ("joint", "separated", "separated_residual")
 ENCODER_ARCHES = ("current", "residual")
+STUDENT_FIXED_ADAPTER_MODES = ("none", "separate")
+STUDENT_FIXED_ADAPTER_STATE_PREFIX = "student_fixed_group_adapters."
 DEFAULT_RESIDUAL_ENCODER_CHANNELS = (64, 96, 128, 192, 256)
 DEFAULT_RESIDUAL_BLOCKS_PER_STAGE = (2, 2, 2, 2, 2)
 DEFAULT_CORRELATION_FEATURE_WIDTH = 96
@@ -85,8 +83,13 @@ def canonicalize_model_config(config: dict | None) -> dict:
     # Checkpoints written before geometry-head ablations used AffineHead. Keep
     # that exact module/state-dict interpretation when the field is absent.
     canonical.setdefault("affine_head_mode", "joint")
+    student_fixed_adapter = str(canonical.setdefault("student_fixed_adapter", "none"))
+    if student_fixed_adapter not in STUDENT_FIXED_ADAPTER_MODES:
+        choices = ", ".join(STUDENT_FIXED_ADAPTER_MODES)
+        raise ValueError(f"student_fixed_adapter must be one of: {choices}")
+    canonical["student_fixed_adapter"] = student_fixed_adapter
 
-    # Encoder fields were added after the original CNN/FPN checkpoints. Missing
+    # Encoder fields were added after the original FPN checkpoints. Missing
     # fields must reconstruct that exact architecture: in particular, an old
     # checkpoint must not gain a learned correlation projection merely because
     # the default for new command-line runs is wider.
@@ -668,7 +671,6 @@ class FeaturePyramidEncoder(nn.Module):
         if encoder_arch not in ENCODER_ARCHES:
             choices = ", ".join(ENCODER_ARCHES)
             raise ValueError(f"encoder_arch must be one of: {choices}")
-
         if encoder_channels is None:
             channels = (
                 DEFAULT_RESIDUAL_ENCODER_CHANNELS
@@ -794,6 +796,38 @@ class ResidualInputAdapter(nn.Module):
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         return image + self.block(image)
+
+
+class StudentFixedGroupAdapter(nn.Module):
+    """Near-identity fixed-side adapter used only by the student branch.
+
+    The second GroupNorm scale starts at zero, so the learned residual branch
+    initially contributes exactly zero before the prescribed final GELU.
+    GroupNorm is unconditional because effective registration batches are small.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        if channels < 1:
+            raise ValueError("Student fixed adapter channels must be positive")
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm1 = _make_norm(channels, "group")
+        self.activation1 = nn.GELU()
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm2 = _make_norm(channels, "group")
+        self.activation2 = nn.GELU()
+
+        nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="relu")
+        nn.init.kaiming_normal_(self.conv2.weight, mode="fan_out", nonlinearity="relu")
+        if not isinstance(self.norm2, nn.GroupNorm):
+            raise AssertionError("Student fixed adapters require GroupNorm")
+        nn.init.zeros_(self.norm2.weight)
+        nn.init.zeros_(self.norm2.bias)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        residual = self.activation1(self.norm1(self.conv1(image)))
+        residual = self.norm2(self.conv2(residual))
+        return self.activation2(image + residual)
 
 
 class FrontendInputAdapter(nn.Module):
@@ -1709,6 +1743,7 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         affine_head_mode: str = "joint",
         separate_group_heads: bool = True,
         separate_group_adapters: bool = True,
+        student_fixed_adapter: str = "none",
     ) -> None:
         super().__init__()
         if num_groups < 1:
@@ -1725,6 +1760,9 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         if encoder_arch not in ENCODER_ARCHES:
             choices = ", ".join(ENCODER_ARCHES)
             raise ValueError(f"encoder_arch must be one of: {choices}")
+        if student_fixed_adapter not in STUDENT_FIXED_ADAPTER_MODES:
+            choices = ", ".join(STUDENT_FIXED_ADAPTER_MODES)
+            raise ValueError(f"student_fixed_adapter must be one of: {choices}")
         if (
             isinstance(group_slots, bool)
             or int(group_slots) != group_slots
@@ -1767,6 +1805,7 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
         self.max_rotation_degrees = float(max_rotation_degrees)
         self.separate_group_heads = bool(separate_group_heads)
         self.separate_group_adapters = bool(separate_group_adapters)
+        self.student_fixed_adapter = student_fixed_adapter
 
         self.structural_frontend = OnlineStructuralFrontend(
             input_channels=self.input_channels,
@@ -1812,6 +1851,14 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
             )
             if self.separate_group_adapters
             else None
+        )
+        self.student_fixed_group_adapters = nn.ModuleDict(
+            {
+                f"G{group_id}": StudentFixedGroupAdapter(self.frontend_channels)
+                for group_id in range(2, 6)
+            }
+            if self.student_fixed_adapter == "separate"
+            else {}
         )
         self.encoder = CorrelationVolumePairEncoder(
             structural_channels=self.frontend_channels,
@@ -1886,6 +1933,34 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
                 chunks.append(module(values[indices]))
             else:
                 chunks.append(module(values[indices], auxiliary[indices]))
+            indices_per_chunk.append(indices)
+        combined_indices = torch.cat(indices_per_chunk)
+        return torch.cat(chunks, dim=0)[torch.argsort(combined_indices)]
+
+    def _route_student_fixed_by_group(
+        self, values: torch.Tensor, group_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply independent G2-G5 student fixed adapters to mixed batches."""
+        if len(self.student_fixed_group_adapters) == 0:
+            return values
+        chunks = []
+        indices_per_chunk = []
+        for group_id in torch.unique(group_ids, sorted=True).tolist():
+            numeric_group_id = int(group_id)
+            indices = torch.nonzero(
+                group_ids == numeric_group_id, as_tuple=False
+            ).reshape(-1)
+            if numeric_group_id == 1:
+                adapted = values[indices]
+            else:
+                key = f"G{numeric_group_id}"
+                if key not in self.student_fixed_group_adapters:
+                    raise ValueError(
+                        "student fixed group adapters are defined only for G2-G5; "
+                        f"received {key}"
+                    )
+                adapted = self.student_fixed_group_adapters[key](values[indices])
+            chunks.append(adapted)
             indices_per_chunk.append(indices)
         combined_indices = torch.cat(indices_per_chunk)
         return torch.cat(chunks, dim=0)[torch.argsort(combined_indices)]
@@ -2104,6 +2179,14 @@ class CorrelationVolumeAffineRegistrationModel(nn.Module):
                 fixed_representation = fixed_representation * fixed_valid.to(
                     fixed_representation.dtype
                 )
+
+        if not adapt_fixed_group and len(self.student_fixed_group_adapters) > 0:
+            fixed_representation = self._route_student_fixed_by_group(
+                fixed_representation, group_ids
+            )
+            fixed_representation = fixed_representation * fixed_valid.to(
+                fixed_representation.dtype
+            )
 
         needs_displacement_stats = self.affine_head_mode == "separated_residual"
         encoder_result = self.encoder(
@@ -2327,9 +2410,20 @@ class GroupPairCorrelationVolumeAffineRegistrationModel(
 ):
     """Training-only teacher with a DataParallel-compatible forward.
 
-    Its parameter names and tensor shapes are identical to the deployable
-    student model, so strict state-dict initialization is supported.
+    It deliberately omits student-only fixed-side adapters. Every remaining
+    shared parameter name and tensor shape is initialized strictly from the student.
     """
+
+    def __init__(
+        self,
+        *args: object,
+        student_fixed_adapter: str = "none",
+        **kwargs: object,
+    ) -> None:
+        if student_fixed_adapter not in STUDENT_FIXED_ADAPTER_MODES:
+            choices = ", ".join(STUDENT_FIXED_ADAPTER_MODES)
+            raise ValueError(f"student_fixed_adapter must be one of: {choices}")
+        super().__init__(*args, student_fixed_adapter="none", **kwargs)
 
     def forward(
         self,
@@ -2393,6 +2487,26 @@ def _canonicalize_auxiliary_metadata(
     return result
 
 
+def _data_parallel_branch_for_batch(
+    branch: nn.Module,
+    batch_size: int,
+) -> tuple[nn.Module, bool]:
+    """Avoid empty replicas when a batch is smaller than the GPU count.
+
+    Auxiliary forwards include scalar keyword arguments. ``nn.DataParallel``
+    replicates those arguments to every device even when the tensor inputs
+    produce fewer chunks, which can invoke an empty replica without the
+    required image tensors. Small final train/validation batches therefore run
+    directly on the primary module; gradients still reach the same parameters.
+    """
+    if not isinstance(branch, nn.DataParallel):
+        return branch, False
+    device_count = len(branch.device_ids)
+    if device_count <= 1 or batch_size < device_count:
+        return branch.module, False
+    return branch, True
+
+
 class TeacherStudentAffineRegistrationModel(nn.Module):
     """Own an inference-safe student and an optional independent teacher."""
 
@@ -2422,10 +2536,36 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
             self.teacher = None
 
     def initialize_teacher_from_student(self) -> None:
-        """Reset the independent teacher to the current student weights."""
+        """Strictly copy all shared weights while excluding student-only adapters."""
         if self.teacher is None:
             raise RuntimeError("Cannot initialize a disabled teacher branch")
-        self.teacher.load_state_dict(self.student.state_dict(), strict=True)
+        student_state = self.student.state_dict()
+        shared_state = {
+            key: value
+            for key, value in student_state.items()
+            if not key.startswith(STUDENT_FIXED_ADAPTER_STATE_PREFIX)
+        }
+        teacher_state = self.teacher.state_dict()
+        missing = sorted(set(teacher_state).difference(shared_state))
+        unexpected = sorted(set(shared_state).difference(teacher_state))
+        shape_mismatches = sorted(
+            key
+            for key in set(shared_state).intersection(teacher_state)
+            if tuple(shared_state[key].shape) != tuple(teacher_state[key].shape)
+        )
+        if missing or unexpected or shape_mismatches:
+            details = []
+            if missing:
+                details.append(f"missing shared teacher keys: {missing}")
+            if unexpected:
+                details.append(f"unexpected shared student keys: {unexpected}")
+            if shape_mismatches:
+                details.append(f"shared shape mismatches: {shape_mismatches}")
+            raise RuntimeError(
+                "Teacher initialization rejected a non-adapter architecture "
+                "mismatch; " + "; ".join(details)
+            )
+        self.teacher.load_state_dict(shared_state, strict=True)
 
     def forward(
         self,
@@ -2435,10 +2575,13 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
         return_aux: bool = False,
     ) -> torch.Tensor | dict[str, object]:
         """Run only the deployable student path."""
+        student, batch_metadata = _data_parallel_branch_for_batch(
+            self.student,
+            fixed_mineral.shape[0],
+        )
         if not return_aux:
-            return self.student(fixed_mineral, moving_group, group)
-        batch_metadata = isinstance(self.student, nn.DataParallel)
-        output = self.student(
+            return student(fixed_mineral, moving_group, group)
+        output = student(
             fixed_mineral,
             moving_group,
             group,
@@ -2460,10 +2603,13 @@ class TeacherStudentAffineRegistrationModel(nn.Module):
             raise RuntimeError(
                 "Teacher branch is disabled; construct with use_teacher_branch=True"
             )
+        teacher, batch_metadata = _data_parallel_branch_for_batch(
+            self.teacher,
+            fixed_mineral.shape[0],
+        )
         if not return_aux:
-            return self.teacher(fixed_mineral, target_group, moving_group, group)
-        batch_metadata = isinstance(self.teacher, nn.DataParallel)
-        output = self.teacher(
+            return teacher(fixed_mineral, target_group, moving_group, group)
+        output = teacher(
             fixed_mineral,
             target_group,
             moving_group,
@@ -2485,6 +2631,8 @@ __all__ = [
     "DEFAULT_RESIDUAL_BLOCKS_PER_STAGE",
     "DEFAULT_RESIDUAL_ENCODER_CHANNELS",
     "ENCODER_ARCHES",
+    "STUDENT_FIXED_ADAPTER_MODES",
+    "STUDENT_FIXED_ADAPTER_STATE_PREFIX",
     "AffineHead",
     "CorrelationVolumeAffineRegistrationModel",
     "DEFAULT_GROUP_SLOTS",
@@ -2505,6 +2653,7 @@ __all__ = [
     "TEACHER_FIXED_INPUT_VERSION",
     "STRUCTURAL_DESCRIPTOR_VERSION",
     "STRUCTURAL_EVIDENCE_EPSILON",
+    "StudentFixedGroupAdapter",
     "TeacherStudentAffineRegistrationModel",
     "canonicalize_model_config",
     "coarse_similarity_from_cost_stats",

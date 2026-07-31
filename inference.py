@@ -1,9 +1,8 @@
-"""Run deployable student inference with a TeacherStudent checkpoint.
+# Run student inference with a TeacherStudent checkpoint.
 
-One predicted affine is shared by all valid stains in each group item. See
-README.md for the current command and output layout. The training-only teacher
-is deliberately never constructed or loaded here.
-"""
+# One predicted affine is shared by all valid stains in each group item. 
+# The training-only teacher is deliberately never constructed or loaded here.
+
 
 from __future__ import annotations
 
@@ -27,6 +26,7 @@ from models import (
     ENCODER_ARCHES,
     FRONTEND_MODES,
     GROUP_INPUT_MODES,
+    STUDENT_FIXED_ADAPTER_MODES,
     CorrelationVolumeAffineRegistrationModel,
     canonicalize_model_config,
 )
@@ -292,6 +292,7 @@ def main(a):
         "input_channels",
         "frontend_mode",
         "group_input_mode",
+        "student_fixed_adapter",
         "group_slots",
         "force_group1_identity",
     }
@@ -339,6 +340,12 @@ def main(a):
         raise ValueError(
             f"Unsupported group_input_mode {cfg['group_input_mode']!r}; expected "
             f"one of {', '.join(GROUP_INPUT_MODES)}"
+        )
+    student_fixed_adapter = cfg["student_fixed_adapter"]
+    if student_fixed_adapter not in STUDENT_FIXED_ADAPTER_MODES:
+        raise ValueError(
+            f"Unsupported student_fixed_adapter {student_fixed_adapter!r}; expected "
+            f"one of {', '.join(STUDENT_FIXED_ADAPTER_MODES)}"
         )
     affine_head_mode = cfg["affine_head_mode"]
     if affine_head_mode not in AFFINE_HEAD_MODES:
