@@ -53,41 +53,43 @@ the same weights. They use the same configured frontend, but different
 fixed-side sources:
 
 ```text
-Deployable student
-Mineral reference -> configured Mineral representation -> G2-G5 adapter -> CNN/FPN --+
-unregistered group -> configured group representation ---> FPN --+-> local cost volumes
-                                                                        -> affine head
-                                                                        -> student_params
+[Deployable student]
 
-Training-only teacher
-Mineral reference      -> configured Mineral representation --+
-registered target group -> configured group representation ----+-> fixed fusion -> shared FPN --+
-unregistered group      -> configured group representation -------------------------------> FPN --+-> local cost volumes
-                                                                                                                 -> affine head
-                                                                                                                 -> teacher_params
+ Mineral Reference                Moving Group
+        │                               │
+ Optional Fixed Adapter        Group-Specific Adapter
+        │                               │
+        └──── Shared-Weight FPN ────────┘
+                        │
+             Local Correlation Volumes
+                        │
+              Group-Specific Affine Head
+                        │
+              Student Affine Transform ^A
+                        │
+             Warp(Moving Group, ^A)
+                        │
+        Image Loss vs Registered Target Group
+
+
+[Training-only teacher]
+
+
+ Registered Mineral       Registered Target Group              Moving Group
+         │                           │                                │
+         └── Evidence-Aware Fusion ──┘                          Group Frontend
+                       │                                              │
+               Teacher Fixed Side             +               Teacher Moving Side
+                                              │
+                                Independent Shared-Weight FPN
+                                              │
+                                  Local Correlation Volumes
+                                              │
+                                    Group-Specific Affine Head
+                                              │
+                                  Teacher Affine Transform A_T
 ```
 
-### Auxiliary cost-volume output and direct correspondence supervision
-
-Branch forwards accept `return_aux=False`. The default remains the legacy
-behavior and returns only the `B x 5` affine-parameter tensor. Training or a
-diagnostic can request `return_aux=True`:
-
-```python
-student_output = model(
-    fixed_mineral=fixed_mineral,
-    moving_group=moving_group,
-    group=group_id,
-    return_aux=True,
-)
-teacher_output = model.forward_teacher(
-    fixed_mineral=fixed_mineral,
-    target_group=target_group,
-    moving_group=moving_group,
-    group=group_id,
-    return_aux=True,
-)
-```
 
 Each output is `{"params": affine_params, "levels": [...]}`. Every selected
 level contains:
