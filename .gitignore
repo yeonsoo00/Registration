@@ -4,6 +4,8 @@ wandb/
 Results/
 Debug/
 Inference/
+Vis/
+StudentOnly/
 
 evaluate_inference_metrics.py
 README2.md
