@@ -5,8 +5,8 @@ Results/
 Debug/
 Inference/
 Vis/
-StudentOnly/
-
+StudentOnly/ckpt
+StudentOnly/Inference
 evaluate_inference_metrics.py
 README2.md
 smoke_test.py

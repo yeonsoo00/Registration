@@ -273,7 +273,7 @@ python train.py \
 --charbonnier_weight 0.1 --gradient_weight 0.1 --overlap_weight 0.5 --reg_weight 0.0 \
 --corr_displacement_weight 1.0 --corr_distribution_weight 0.50 \
 --corr_confidence_weight 0.1 --corr_target_sigma 1.0 --student_corr_weight 1.0 \
---teacher_corr_weight 1.0 --epochs 1000 --batch_size 4 --lr 0.0003 \
+--teacher_corr_weight 1.0 --epochs 600 --batch_size 4 --lr 0.0003 \
 --weight_decay 0.00001 --grad_clip 1.0 --val_split 0.15 --split_seed 2026 \
 --n_workers 8 --amp 
 ```
@@ -301,7 +301,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --frontend_mode raw --group_input_mode overlay \
   --affine_head_mode separated \
   --teacher_distill_weight 1.0 --detach_teacher \
-  --teacher_warmup_epochs 200 \
+  --teacher_warmup_epochs 50 \
   --no-include_group1 --force_group1_identity \
   --structural_distance_scale 0.03 \
   --structural_context_scale 0.03 \
@@ -331,7 +331,7 @@ conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Co
   --corr_confidence_weight 0.0 \
   --corr_target_sigma 1.0 \
   --student_corr_weight 1.0 --teacher_corr_weight 1.0 \
-  --epochs 800 --batch_size 4 --lr 0.0001 \
+  --epochs 600 --batch_size 4 --lr 0.0001 \
   --weight_decay 0.00001 --grad_clip 1.0 \
   --val_split 0.15 --split_seed 2026 \
   --n_workers 8 --amp

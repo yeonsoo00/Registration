@@ -21,12 +21,6 @@ model or warp code. This keeps the comparison focused on removing the teacher:
 - Inference still requires only registered Mineral, an unregistered moving
   group, and its group ID.
 
-The supplied teacher-student command did not specify
-`--student_fixed_adapter`, whose backward-compatible default is `none`.
-The command below makes that choice explicit so its student architecture
-matches the supplied run exactly. If the teacher-student checkpoint being
-compared was instead trained with group-specific fixed-side adapters, use
-`--student_fixed_adapter separate` in both experiments.
 
 ## Model and loss equivalence
 
@@ -105,15 +99,14 @@ teacher-specific training options.
 
 ## Comparison budget
 
-The command above holds the overall experiment length fixed at 1,000 epochs.
-It therefore gives the student 1,000 optimization epochs. In the supplied
+The command above holds the experiment length fixed at 600 epochs. In the supplied
 teacher-student run, epochs 1 through 50 train only the teacher, so the student
-receives 950 optimization epochs.
+receives 550 optimization epochs.
 
 Report which of these comparison protocols is used:
 
-- Equal total training duration: keep `--epochs 1000`.
-- Equal student optimization epochs: use `--epochs 950` for the student-only
+- Equal total training duration: keep `--epochs 600`.
+- Equal student optimization epochs: use `--epochs 550` for the student-only
   run.
 
 The same `--split_seed 2026`, preprocessing, synthetic ranges, batch size, and
@@ -129,16 +122,8 @@ Training writes:
 - `best_model_student.pt` and `last_model_student.pt`: compact deployable
   student artifacts suitable for inference.
 
-Although the shared checkpoint schema retains the historical
-`correlation_volume_teacher_student_affine_v1` architecture identifier, a
-student-only full checkpoint records `use_teacher_branch=False` and contains
-no `teacher_model_state_dict`.
 
-Resume a student-only run from its full `.pt` checkpoint. Do not use a
-`*_student.pt` artifact with `--resume_checkpoint`, because deployable artifacts
-do not contain optimizer/scheduler state. A full checkpoint from a run that
-contains a teacher is also intentionally rejected when resuming student-only
-training; branch-presence mismatches are not silently ignored.
+Resume a student-only run from its full `.pt` checkpoint. 
 
 ## Target-free inference
 
@@ -146,10 +131,10 @@ Use the compact deployable checkpoint when registered target stains are not
 available:
 
 ```bash
-conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/infer.py \
-  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/ckpt/stage1_residual_corr_raw/best_model_student.pt \
-  --unregistered_root /home/yec23006/projects/research/Registration/Data/Testdata/Unregistered/raw \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/Inference/stage1 \
+conda run -n reg python StudentOnly/infer.py \
+  --checkpoint <PATH/TO/FILE> \
+  --unregistered_root <PATH/TO/DIR> \
+  --output_dir <PATH/TO/DIR> \
   --batch_size 4 --n_workers 8 --gpu_ids 0,1
 ```
 
@@ -168,11 +153,11 @@ loaded.
 Add `--registered_root` to load registered stains for evaluation only:
 
 ```bash
-conda run -n reg python /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/infer.py \
-  --checkpoint /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/ckpt/stage1_residual_corr_raw/best_model_student.pt \
-  --registered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Registered \
-  --unregistered_root /home/yec23006/projects/research/Registration/Data/Cartilage/Unregistered \
-  --output_dir /home/yec23006/projects/research/Registration/Grouped/Correlation_Vol_Net/TeacherStudent/StudentOnly/Inference/stage1_with_metrics \
+conda run -n reg python StudentOnly/infer.py \
+  --checkpoint <PATH/TO/FILE> \
+  --registered_root <PATH/TO/DIR> \
+  --unregistered_root <PATH/TO/DIR> \
+  --output_dir <PATH/TO/DIR> \
   --batch_size 4 --n_workers 8 --gpu_ids 0,1
 ```
 
@@ -190,4 +175,3 @@ path:
 - `predicted_group_affine_parameters.csv`: the shared group affine parameters;
 - `registered_target_metrics.csv`: optional per-stain MAE/NCC diagnostics when
   `--registered_root` is supplied.
-
